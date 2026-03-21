@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+.resolve-clip-search/
+.venv/
+.env
+node_modules/
+frontend/dist/
+.swift-module-cache/

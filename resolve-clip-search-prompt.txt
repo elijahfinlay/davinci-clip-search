@@ -1,0 +1,182 @@
+---PAGE 1---
+Prompt: Build a DaVinci Resolve Timeline Clip Search
+Tool
+Use this prompt in Claude Code to build the tool.
+The Prompt
+Build me a Python-based clip search tool for DaVinci Resolve that lets me search across all
+timelines in my current project using natural language, metadata, or visual descriptions —
+and then jump the Resolve playhead directly to the matching clip.
+What it does
+This tool indexes every clip across every timeline in the current Resolve project and makes
+them searchable. When I find what I want, it jumps me straight to that clip in Resolve.
+How it connects to Resolve
+Use the DaVinci Resolve Scripting API (Python). Resolve must be running. Connect via:
+import DaVinciResolveScript as dvr_script
+resolve = dvr_script.scriptapp("Resolve")
+Environment variables needed (set these or detect OS and set automatically):
+Mac:
+RESOLVE_SCRIPT_API="/Library/Application Support/Blackmagic Design/DaVinci
+Resolve/Developer/Scripting"
+RESOLVE_SCRIPT_LIB="/Applications/DaVinci Resolve/DaVinci
+Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
+PYTHONPATH="$PYTHONPATH:$RESOLVE_SCRIPT_API/Modules/"
+Windows:
+RESOLVE_SCRIPT_API="%PROGRAMDATA%\Blackmagic Design\DaVinci
+Resolve\Support\Developer\Scripting"
+---PAGE 2---
+RESOLVE_SCRIPT_LIB="C:\Program Files\Blackmagic Design\DaVinci
+Resolve\fusionscript.dll"
+PYTHONPATH="%PYTHONPATH%;%RESOLVE_SCRIPT_API%\Modules\"
+Indexing — what to capture per clip
+For every TimelineItem across every video track of every timeline, extract and store:
+Metadata:
+Clip name / filename
+Source file path (via MediaPoolItem)
+Timeline name it belongs to
+Track number and index
+Start timecode on timeline (TimelineItem.GetStart())
+End timecode / duration
+Source in/out points
+Frame rate
+Resolution
+Codec (if available via MediaPoolItem.GetClipProperty())
+Any clip markers (GetMarkers()) — color, name, notes, customData
+Any timeline markers near the clip
+Visual analysis (for “sight”):
+Extract thumbnail via GetCurrentClipThumbnailImage() on the Color page, OR
+Extract keyframes from the source media file using FFmpeg (1 frame per 2 seconds)
+For each extracted frame, generate a text description using Claude’s vision capability
+(describe the scene, shot type, camera movement, subject, lighting, mood)
+Store these descriptions as searchable text in the index
+Audio analysis (if feasible):
+Detect if clip has audio
+If transcription is available (Resolve’s TranscribeAudio or external Whisper), include
+---PAGE 3---
+transcript text
+The index
+Store the index as a local JSON or SQLite database file. Structure:
+{
+"project_name": "...",
+"indexed_at": "ISO timestamp",
+"timelines": [
+{
+"timeline_name": "...",
+"clips": [
+{
+"clip_id": "unique_id",
+"clip_name": "...",
+"file_path": "...",
+"timeline_name": "...",
+"track": 1,
+"start_timecode": "01:00:05:12",
+"start_frame": 86532,
+"end_frame": 86700,
+"duration_frames": 168,
+"fps": 23.976,
+"resolution": "3840x2160",
+"codec": "H.265",
+"markers": [...],
+"visual_descriptions": [
+{
+"frame_offset_sec": 0.0,
+"description": "Wide aerial drone shot of coastline at sunset, camera slowly pa
+},
+{
+"frame_offset_sec": 2.0,
+"description": "..."
+}
+],
+"transcript": "...",
+"tags": ["drone", "aerial", "coastline", "sunset", "pan", "golden hour"]
+}
+]
+}
+]
+}
+Search capabilities
+---PAGE 4---
+The search should handle ALL of these query types:
+1. Visual / semantic: “find me a wide shot of a city at night”
+2. Metadata: “all clips longer than 5 seconds” or “clips from the drone folder”
+3. Motion type: “push-in shots” or “static shots” or “pan left”
+4. Mood / feel: “something calm and slow” or “high energy”
+5. Filename: “DSC
+_0034” or partial matches
+6. Markers: “clips with red markers” or “clips marked TODO”
+7. Transcript: “where does he say ‘welcome’” (if transcript available)
+8. Combined: “drone shot of water, longer than 3 seconds, in Timeline 2”
+For semantic/visual search, use Claude’s API to compare the query against stored visual
+descriptions. For metadata search, use direct filtering. Allow combining both in a single
+query.
+Jump to clip
+When the user selects a search result, the tool should:
+1. Switch to the correct timeline: use SetCurrentTimeline() on the MediaPool
+2. Navigate to the Edit page: resolve.OpenPage("edit")
+3. Move the playhead to the clip’s start timecode:
+timeline.SetCurrentTimecode(start_timecode)
+This puts the user directly at the clip in Resolve’s edit page.
+User interface
+Build this as an interactive CLI that runs alongside Resolve. The flow:
+$ python resolve_clip_search.py
+Connecting to DaVinci Resolve...
+Connected. Project: "My Documentary"
+[i] Index not found. Index now? (y/n): y
+Indexing Timeline 1/3: "Main Edit"...
+Track 1: 47 clips
+---PAGE 5---
+Track 2: 12 clips
+Extracting visual descriptions... (this may take a few minutes)
+████████████████████ 100%
+Indexing Timeline 2/3: "B-Roll Selects"...
+...
+Index complete. 142 clips across 3 timelines.
+Index saved to: ./resolve_search_index.json
+Search > wide shot of mountains
+Results (3 matches):
+1. [B-Roll Selects] "DJI_0089.MP4" at 01:02:15:00
+Wide aerial drone shot of mountain range, early morning fog
+Duration: 8.2s | Track 1 | Tags: drone, mountains, aerial, fog
+2. [B-Roll Selects] "DJI_0091.MP4" at 01:02:45:12
+Establishing wide shot, snow-capped peaks, clear sky
+Duration: 6.1s | Track 1 | Tags: drone, mountains, snow, wide
+3. [Main Edit] "A7S_1204.MP4" at 00:15:33:08
+Handheld wide shot of mountain trail, hiker in frame
+Duration: 4.3s | Track 2 | Tags: handheld, mountains, trail, person
+Jump to clip (1-3, or 'n' for new search): 2
+Jumping to "DJI_0091.MP4" in "B-Roll Selects" at 01:02:45:12...
+Done. Playhead is now at the clip.
+Search >
+Re-indexing
+On launch, check if an index exists and when it was last built.
+If the timeline has changed (different clip count or modified timelines), prompt to re-
+index.
+Support reindex command to force a fresh index.
+Support reindex --timeline "B-Roll Selects" to re-index a single timeline.
+Performance considerations
+Visual description generation is the expensive part (sending frames to Claude API).
+---PAGE 6---
+Cache aggressively — only re-describe clips that are new or changed.
+For large projects (500+ clips), show progress and allow canceling.
+Store the index file in the project directory or a configurable location.
+Consider a “quick index” mode that skips visual analysis and only indexes metadata
+(instant, but no semantic search).
+Error handling
+If Resolve is not running, print a clear message and exit.
+If the scripting API is not accessible, guide the user to check Resolve Preferences >
+General > External Scripting.
+If a timeline switch fails, report which timeline and suggest the user check if the project
+is still open.
+If FFmpeg is not installed (needed for frame extraction), fall back to Resolve’s thumbnail
+API or prompt to install.
+Dependencies
+Python 3.10+ (match Resolve’s Python version)
+DaVinciResolveScript (comes with Resolve)
+Anthropic Python SDK (for Claude vision API calls during indexing)
+FFmpeg (for frame extraction, optional but preferred)
+SQLite or JSON for index storage
+Stretch goals (build these if time allows)
+Web UI: A simple local web interface (Flask/FastAPI) with thumbnail previews of search
+results, clickable to jump to clip.
+Batch operations: “Select all drone shots and add a blue marker to each”
+Smart playlists: Save searches as named filters that auto-update.
+Export: Export search results as an EDL or XML sub-timeline.
