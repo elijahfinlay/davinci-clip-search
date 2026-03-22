@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import re
 import threading
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from backend.config import Settings
 
 from .index_store import IndexStore
 from .resolve_api import ResolveFacade, ResolveConnectionError, safe_call
+from .search import canonical_clip_type, format_fps, human_duration
 from .timecode import timeline_frame_to_timecode
 from .types import (
     ClipRecord,
@@ -25,6 +27,7 @@ from .vision import build_visual_analyzer
 
 
 ProgressCallback = Callable[[ReindexState], None]
+PartialClipCallback = Callable[[ClipRecord, str], None]
 
 
 def now_iso() -> str:
@@ -261,6 +264,26 @@ def build_source_signature(
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def clip_record_to_result(clip: ClipRecord) -> dict[str, Any]:
+    thumbnail = None
+    if clip.thumbnail_data or clip.file_path:
+        thumbnail = f"/api/clips/{clip.clip_id}/thumbnail"
+    return {
+        "id": clip.clip_id,
+        "filename": clip.file_name or clip.clip_name,
+        "timeline": clip.timeline_name,
+        "timecode": clip.start_timecode,
+        "duration": human_duration(clip.duration_seconds),
+        "track": clip.track,
+        "description": clip.description or clip.clip_name,
+        "tags": clip.tags,
+        "type": canonical_clip_type(clip.clip_type),
+        "fps": format_fps(clip.fps),
+        "resolution": clip.resolution,
+        "thumbnail": thumbnail,
+    }
+
+
 class IndexingService:
     def __init__(
         self,
@@ -328,9 +351,22 @@ class IndexingService:
         if progress_callback:
             progress_callback(state)
 
+        run_indexed_at = state.started_at or now_iso()
+        self.store.upsert_project_meta(
+            ProjectIndexMeta(
+                project_uid=signature["project_uid"],
+                project_name=signature["project_name"],
+                indexed_at=run_indexed_at,
+                clip_count=signature["clip_count"],
+                timeline_count=signature["timeline_count"],
+                signature_hash=signature["signature_hash"],
+                quick_mode=quick_mode,
+            )
+        )
+
         def _index(_resolve: Any, _project_manager: Any, project: Any) -> None:
-            clip_records: list[ClipRecord] = []
-            timeline_records: list[TimelineRecord] = []
+            seen_clip_ids: set[str] = set()
+            seen_timeline_uids: set[str] = set()
 
             timeline_count = safe_call(project.GetTimelineCount, default=0) or 0
             current_indexed = 0
@@ -367,6 +403,15 @@ class IndexingService:
                     in {"1", "true", "yes"}
                     or ";" in timeline_start_tc
                 )
+                self.store.upsert_timeline(
+                    TimelineRecord(
+                        timeline_uid=timeline_uid,
+                        project_uid=signature["project_uid"],
+                        timeline_name=timeline_name,
+                        timeline_index=timeline_index,
+                        clip_count=0,
+                    )
+                )
 
                 track_count = safe_call(timeline.GetTrackCount, "video", default=0) or 0
                 timeline_clip_count = 0
@@ -388,6 +433,34 @@ class IndexingService:
                         key=lambda item: safe_call(item.GetStart, default=0) or 0,
                     )
                     for item_index, item in enumerate(ordered_items, start=1):
+                        clip_label = safe_call(item.GetName) or f"Clip {item_index}"
+                        state.current_timeline = timeline_name
+                        state.active_clip_index = current_indexed + 1
+                        state.active_clip_name = clip_label
+                        state.message = (
+                            f'Detecting objects {current_indexed + 1}/{total_target_clips}: {clip_label}'
+                        )
+                        if progress_callback:
+                            progress_callback(state)
+
+                        def handle_partial_clip(
+                            partial_clip: ClipRecord,
+                            stage_label: str,
+                        ) -> None:
+                            seen_clip_ids.add(partial_clip.clip_id)
+                            self.store.upsert_clip(
+                                partial_clip,
+                                indexed_at=run_indexed_at,
+                            )
+                            state.message = (
+                                f"{stage_label} {current_indexed + 1}/{total_target_clips}: "
+                                f"{clip_label}"
+                            )
+                            state.latest_clip = clip_record_to_result(partial_clip)
+                            state.latest_clip_stage = stage_label
+                            if progress_callback:
+                                progress_callback(state)
+
                         clip = self._build_clip_record(
                             project=project,
                             signature=signature,
@@ -407,18 +480,22 @@ class IndexingService:
                             existing_cache_by_clip_id=existing_cache_by_clip_id,
                             existing_cache_by_content_signature=existing_cache_by_content_signature,
                             quick_mode=quick_mode,
+                            partial_record_callback=handle_partial_clip,
                         )
-                        clip_records.append(clip)
+                        self.store.upsert_clip(clip, indexed_at=run_indexed_at)
+                        seen_clip_ids.add(clip.clip_id)
                         timeline_clip_count += 1
                         current_indexed += 1
                         state.processed_clips = current_indexed
                         if total_target_clips:
                             state.progress = min(current_indexed / total_target_clips, 1.0)
                         state.message = f'Indexed {current_indexed}/{total_target_clips} clips'
+                        state.latest_clip = clip_record_to_result(clip)
+                        state.latest_clip_stage = "Completed clip"
                         if progress_callback:
                             progress_callback(state)
 
-                timeline_records.append(
+                self.store.upsert_timeline(
                     TimelineRecord(
                         timeline_uid=timeline_uid,
                         project_uid=signature["project_uid"],
@@ -427,22 +504,26 @@ class IndexingService:
                         clip_count=timeline_clip_count,
                     )
                 )
+                seen_timeline_uids.add(timeline_uid)
 
-            project_meta = ProjectIndexMeta(
+            self.store.cleanup_index_scope(
                 project_uid=signature["project_uid"],
-                project_name=signature["project_name"],
-                indexed_at=now_iso(),
-                clip_count=signature["clip_count"],
-                timeline_count=signature["timeline_count"],
-                signature_hash=signature["signature_hash"],
-                quick_mode=quick_mode,
+                keep_clip_ids=seen_clip_ids,
+                keep_timeline_uids=seen_timeline_uids,
+                target_timeline_uids=(
+                    replace_timeline_uids if (target_uids or target_names) else None
+                ),
             )
-
-            self.store.replace_index(
-                project_meta,
-                timeline_records,
-                clip_records,
-                replace_timeline_uids=replace_timeline_uids if (target_uids or target_names) else None,
+            self.store.finalize_project_meta(
+                ProjectIndexMeta(
+                    project_uid=signature["project_uid"],
+                    project_name=signature["project_name"],
+                    indexed_at=now_iso(),
+                    clip_count=signature["clip_count"],
+                    timeline_count=signature["timeline_count"],
+                    signature_hash=signature["signature_hash"],
+                    quick_mode=quick_mode,
+                )
             )
 
         self.resolve.with_project(_index)
@@ -468,6 +549,7 @@ class IndexingService:
         existing_cache_by_clip_id: dict[str, dict[str, Any]],
         existing_cache_by_content_signature: dict[str, list[dict[str, Any]]],
         quick_mode: bool,
+        partial_record_callback: PartialClipCallback | None = None,
     ) -> ClipRecord:
         media_pool_item = safe_call(item.GetMediaPoolItem)
         clip_props = safe_call(media_pool_item.GetClipProperty, default={}) if media_pool_item else {}
@@ -588,7 +670,8 @@ class IndexingService:
         desired_vision_signature = (
             "quick:v1" if quick_mode else self.visual_analyzer.cache_signature()
         )
-        source_signature = build_source_signature(
+        analysis_duration_seconds = (max(duration_frames, 0) / fps) if fps else 0.0
+        desired_source_signature = build_source_signature(
             clip_name=clip_name,
             file_path=file_path,
             timeline_name=timeline_name,
@@ -605,6 +688,90 @@ class IndexingService:
             vision_cache_signature=desired_vision_signature,
         )
 
+        has_audio = any(
+            lookup_value(clip_props, key)
+            for key in ("Audio Codec", "Audio Channels", "Sample Rate", "Audio Bit Depth")
+        )
+
+        def compose_clip_record(
+            *,
+            clip_type_value: str,
+            tags_value: list[str],
+            visual_descriptions_value: list[VisualDescription],
+            description_value: str,
+            transcript_value: str | None,
+            source_signature_value: str,
+            vision_cache_signature_value: str,
+            thumbnail_data_value: str | None,
+        ) -> ClipRecord:
+            resolved_description = description_value.strip()
+            if not resolved_description:
+                resolved_description = build_description(
+                    clip_name=clip_name,
+                    clip_type=clip_type_value,
+                    timeline_name=timeline_name,
+                    track_name=track_name,
+                    tags=tags_value,
+                    transcript=transcript_value,
+                    visual_descriptions=visual_descriptions_value,
+                )
+
+            searchable_text = build_searchable_text(
+                clip_name=clip_name,
+                file_name=file_name,
+                file_path=file_path,
+                timeline_name=timeline_name,
+                track_name=track_name,
+                description=resolved_description,
+                transcript=transcript_value,
+                tags=tags_value,
+                clip_type=clip_type_value,
+                markers=all_markers,
+                timeline_markers=near_markers,
+                visual_descriptions=visual_descriptions_value,
+                codec=codec,
+                resolution=resolution,
+            )
+
+            return ClipRecord(
+                clip_id=clip_id,
+                content_signature=content_signature,
+                vision_cache_signature=vision_cache_signature_value,
+                project_uid=signature["project_uid"],
+                timeline_uid=timeline_uid,
+                timeline_name=timeline_name,
+                timeline_index=timeline_index,
+                clip_name=clip_name,
+                file_path=file_path,
+                file_name=file_name,
+                track=track_index,
+                track_name=track_name,
+                item_index=item_index,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                duration_frames=max(duration_frames, 0),
+                duration_seconds=analysis_duration_seconds,
+                fps=fps,
+                start_timecode=tc_start,
+                end_timecode=tc_end,
+                source_in=str(source_in) if source_in is not None else None,
+                source_out=str(source_out) if source_out is not None else None,
+                resolution=str(resolution) if resolution is not None else None,
+                codec=str(codec) if codec is not None else None,
+                clip_color=str(clip_color) if clip_color is not None else None,
+                clip_type=clip_type_value,
+                has_audio=bool(has_audio),
+                description=resolved_description,
+                transcript=str(transcript_value) if transcript_value is not None else None,
+                tags=tags_value,
+                markers=all_markers,
+                timeline_markers=near_markers,
+                visual_descriptions=visual_descriptions_value,
+                searchable_text=searchable_text,
+                source_signature=source_signature_value,
+                thumbnail_data=thumbnail_data_value,
+            )
+
         cached = existing_cache_by_clip_id.get(clip_id)
         if cached and cached.get("content_signature") != content_signature:
             cached = None
@@ -617,14 +784,16 @@ class IndexingService:
         visual_descriptions: list[VisualDescription]
         description: str
         thumbnail_data: str | None = cached.get("thumbnail_data") if cached else None
+        effective_vision_signature = desired_vision_signature
         cached_visual_descriptions = [
             VisualDescription(
                 frame_offset_sec=float(item["frame_offset_sec"]),
                 description=str(item["description"]),
             )
-            for item in json.loads(cached["visual_descriptions_json"])
+        for item in json.loads(cached["visual_descriptions_json"])
         ] if cached else []
         cached_description = str(cached.get("description") or "") if cached else ""
+        cached_vision_signature = str(cached.get("vision_cache_signature") or "") if cached else ""
         cached_has_stale_heuristic_visual = (
             bool(cached)
             and not quick_mode
@@ -636,11 +805,19 @@ class IndexingService:
                 file_path=file_path,
             )
         )
+        cached_analysis_reusable = (
+            bool(cached)
+            and not quick_mode
+            and cached_vision_signature == desired_vision_signature
+            and not cached_has_stale_heuristic_visual
+        )
 
         if (
             cached
-            and cached["source_signature"] == source_signature
-            and not cached_has_stale_heuristic_visual
+            and (
+                cached["source_signature"] == desired_source_signature
+                or cached_analysis_reusable
+            )
         ):
             visual_descriptions = cached_visual_descriptions
             description = cached_description
@@ -648,18 +825,61 @@ class IndexingService:
             thumbnail_data = cached.get("thumbnail_data")
             clip_type = str(cached.get("clip_type") or clip_type)
             tags = dedupe(tags + json.loads(cached["tags_json"]))
+            if cached_vision_signature:
+                effective_vision_signature = cached_vision_signature
+            source_signature = str(
+                cached.get("source_signature") or desired_source_signature
+            )
         else:
             visual_descriptions = []
             description = ""
             transcript = transcript or (cached.get("transcript") if cached else None)
             actual_vision_signature = desired_vision_signature
+            source_signature = desired_source_signature
             if not quick_mode:
+                def emit_partial_analysis(analysis: Any) -> None:
+                    if not partial_record_callback:
+                        return
+
+                    partial_clip_type = analysis.clip_type_hint or clip_type
+                    partial_tags = dedupe(tags + analysis.tags + [partial_clip_type])
+                    partial_source_signature = build_source_signature(
+                        clip_name=clip_name,
+                        file_path=file_path,
+                        timeline_name=timeline_name,
+                        track_index=track_index,
+                        start_frame=start_frame,
+                        end_frame=end_frame,
+                        duration_frames=duration_frames,
+                        fps=fps,
+                        resolution=str(resolution) if resolution is not None else None,
+                        codec=str(codec) if codec is not None else None,
+                        markers=all_markers,
+                        timeline_markers=near_markers,
+                        transcript=str(transcript) if transcript is not None else None,
+                        vision_cache_signature=analysis.cache_signature,
+                    )
+                    partial_record_callback(
+                        compose_clip_record(
+                            clip_type_value=partial_clip_type,
+                            tags_value=partial_tags,
+                            visual_descriptions_value=analysis.frame_descriptions,
+                            description_value=analysis.summary,
+                            transcript_value=transcript,
+                            source_signature_value=partial_source_signature,
+                            vision_cache_signature_value=analysis.cache_signature,
+                            thumbnail_data_value=thumbnail_data,
+                        ),
+                        "Saved YOLO objects for",
+                    )
+
                 analysis = self.visual_analyzer.analyze(
                     clip_name=clip_name,
                     clip_type=clip_type,
                     tags=tags,
                     file_path=file_path,
-                    duration_seconds=(max(duration_frames, 0) / fps) if fps else 0.0,
+                    duration_seconds=analysis_duration_seconds,
+                    partial_callback=emit_partial_analysis,
                 )
                 visual_descriptions = analysis.frame_descriptions
                 actual_vision_signature = analysis.cache_signature
@@ -697,65 +917,17 @@ class IndexingService:
                 transcript=str(transcript) if transcript is not None else None,
                 vision_cache_signature=actual_vision_signature,
             )
+            effective_vision_signature = actual_vision_signature
 
-        searchable_text = build_searchable_text(
-            clip_name=clip_name,
-            file_name=file_name,
-            file_path=file_path,
-            timeline_name=timeline_name,
-            track_name=track_name,
-            description=description,
-            transcript=transcript,
-            tags=tags,
-            clip_type=clip_type,
-            markers=all_markers,
-            timeline_markers=near_markers,
-            visual_descriptions=visual_descriptions,
-            codec=codec,
-            resolution=resolution,
-        )
-
-        has_audio = any(
-            lookup_value(clip_props, key)
-            for key in ("Audio Codec", "Audio Channels", "Sample Rate", "Audio Bit Depth")
-        )
-
-        return ClipRecord(
-            clip_id=clip_id,
-            content_signature=content_signature,
-            project_uid=signature["project_uid"],
-            timeline_uid=timeline_uid,
-            timeline_name=timeline_name,
-            timeline_index=timeline_index,
-            clip_name=clip_name,
-            file_path=file_path,
-            file_name=file_name,
-            track=track_index,
-            track_name=track_name,
-            item_index=item_index,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            duration_frames=max(duration_frames, 0),
-            duration_seconds=(max(duration_frames, 0) / fps) if fps else 0.0,
-            fps=fps,
-            start_timecode=tc_start,
-            end_timecode=tc_end,
-            source_in=str(source_in) if source_in is not None else None,
-            source_out=str(source_out) if source_out is not None else None,
-            resolution=str(resolution) if resolution is not None else None,
-            codec=str(codec) if codec is not None else None,
-            clip_color=str(clip_color) if clip_color is not None else None,
-            clip_type=clip_type,
-            has_audio=bool(has_audio),
-            description=description,
-            transcript=str(transcript) if transcript is not None else None,
-            tags=tags,
-            markers=all_markers,
-            timeline_markers=near_markers,
-            visual_descriptions=visual_descriptions,
-            searchable_text=searchable_text,
-            source_signature=source_signature,
-            thumbnail_data=thumbnail_data,
+        return compose_clip_record(
+            clip_type_value=clip_type,
+            tags_value=tags,
+            visual_descriptions_value=visual_descriptions,
+            description_value=description,
+            transcript_value=transcript,
+            source_signature_value=source_signature,
+            vision_cache_signature_value=effective_vision_signature,
+            thumbnail_data_value=thumbnail_data,
         )
 
     @staticmethod
@@ -773,6 +945,7 @@ class ReindexCoordinator:
         self._state = ReindexState()
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
+        self._listeners: set[queue.Queue[dict[str, Any]]] = set()
 
     def snapshot(self) -> ReindexState:
         with self._lock:
@@ -799,8 +972,11 @@ class ReindexCoordinator:
                 current_timeline=None,
                 processed_clips=0,
                 total_clips=0,
+                active_clip_index=0,
+                active_clip_name=None,
                 quick_mode=quick_mode,
             )
+            self._broadcast_locked()
 
             self._worker = threading.Thread(
                 target=self._run,
@@ -817,6 +993,41 @@ class ReindexCoordinator:
     def _update(self, state: ReindexState) -> None:
         with self._lock:
             self._state = ReindexState(**state.to_dict())
+            self._broadcast_locked()
+
+    def subscribe(self) -> queue.Queue[dict[str, Any]]:
+        listener: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8)
+        with self._lock:
+            self._listeners.add(listener)
+            self._push_state(listener, self._state.to_dict())
+        return listener
+
+    def unsubscribe(self, listener: queue.Queue[dict[str, Any]]) -> None:
+        with self._lock:
+            self._listeners.discard(listener)
+
+    def _broadcast_locked(self) -> None:
+        payload = self._state.to_dict()
+        stale: list[queue.Queue[dict[str, Any]]] = []
+        for listener in self._listeners:
+            try:
+                self._push_state(listener, payload)
+            except Exception:
+                stale.append(listener)
+        for listener in stale:
+            self._listeners.discard(listener)
+
+    @staticmethod
+    def _push_state(listener: queue.Queue[dict[str, Any]], payload: dict[str, Any]) -> None:
+        while True:
+            try:
+                listener.put_nowait(payload)
+                return
+            except queue.Full:
+                try:
+                    listener.get_nowait()
+                except queue.Empty:
+                    return
 
     def _run(
         self,
@@ -837,9 +1048,15 @@ class ReindexCoordinator:
                 self._state.progress = 1.0
                 self._state.message = "Index complete"
                 self._state.finished_at = now_iso()
+                self._state.active_clip_index = 0
+                self._state.active_clip_name = None
+                self._broadcast_locked()
         except Exception as exc:
             with self._lock:
                 self._state.running = False
                 self._state.last_error = str(exc)
                 self._state.message = "Indexing failed"
                 self._state.finished_at = now_iso()
+                self._state.active_clip_index = 0
+                self._state.active_clip_name = None
+                self._broadcast_locked()

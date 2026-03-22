@@ -72,7 +72,11 @@ class ReindexStateModel(BaseModel):
     current_timeline: str | None = None
     processed_clips: int = 0
     total_clips: int = 0
+    active_clip_index: int = 0
+    active_clip_name: str | None = None
     quick_mode: bool = False
+    latest_clip: SearchResultModel | None = None
+    latest_clip_stage: str | None = None
 
 
 class StatusResponseModel(BaseModel):

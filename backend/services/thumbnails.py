@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import shutil
 import subprocess
 import threading
@@ -9,6 +10,9 @@ from pathlib import Path
 from backend.config import Settings
 
 from .index_store import IndexStore
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ThumbnailService:
@@ -66,37 +70,41 @@ class ThumbnailService:
 
     def _extract_preview_bytes(self, file_path: str) -> bytes | None:
         for timestamp in ("1.0", "0.0"):
-            result = subprocess.run(
-                [
-                    self._ffmpeg,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-ss",
-                    timestamp,
-                    "-i",
-                    file_path,
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    (
-                        f"scale={self.settings.thumbnail_source_width}:"
-                        f"{self.settings.thumbnail_source_height}:"
-                        "force_original_aspect_ratio=increase,"
-                        f"crop={self.settings.thumbnail_source_width}:"
-                        f"{self.settings.thumbnail_source_height}"
-                    ),
-                    "-q:v",
-                    str(self.settings.thumbnail_jpeg_quality),
-                    "-f",
-                    "image2pipe",
-                    "-vcodec",
-                    "mjpeg",
-                    "-",
-                ],
-                capture_output=True,
-                check=False,
-            )
+            try:
+                result = subprocess.run(
+                    [
+                        self._ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        timestamp,
+                        "-i",
+                        file_path,
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        (
+                            f"scale={self.settings.thumbnail_source_width}:"
+                            f"{self.settings.thumbnail_source_height}:"
+                            "force_original_aspect_ratio=increase,"
+                            f"crop={self.settings.thumbnail_source_width}:"
+                            f"{self.settings.thumbnail_source_height}"
+                        ),
+                        "-q:v",
+                        str(self.settings.thumbnail_jpeg_quality),
+                        "-f",
+                        "image2pipe",
+                        "-vcodec",
+                        "mjpeg",
+                        "-",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+            except OSError as exc:
+                LOGGER.warning("Thumbnail extraction skipped for %s: %s", file_path, exc)
+                return None
             if result.returncode == 0 and result.stdout:
                 return result.stdout
         return None

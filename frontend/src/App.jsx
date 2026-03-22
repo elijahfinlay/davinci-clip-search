@@ -63,6 +63,8 @@ async function request(path, options = {}) {
 
 function ClipThumbnail({ type, index, thumbnail }) {
   const [imageFailed, setImageFailed] = useState(false);
+  const [shouldLoad, setShouldLoad] = useState(false);
+  const containerRef = useRef(null);
   const gradients = {
     drone: ["#1a3a4a", "#2d6a7a", "#4a9ab0"],
     handheld: ["#3a2a1a", "#6a4a2a", "#a07040"],
@@ -73,19 +75,53 @@ function ClipThumbnail({ type, index, thumbnail }) {
 
   useEffect(() => {
     setImageFailed(false);
+    setShouldLoad(false);
   }, [thumbnail]);
 
-  if (thumbnail && !imageFailed) {
-    return (
-      <div
-        style={{
-          width: "100%",
-          height: "100%",
-          borderRadius: 6,
-          overflow: "hidden",
-          background: "rgba(255,255,255,0.03)",
-        }}
-      >
+  useEffect(() => {
+    if (!thumbnail || shouldLoad) {
+      return undefined;
+    }
+
+    const node = containerRef.current;
+    if (!node || typeof window === "undefined" || !("IntersectionObserver" in window)) {
+      setShouldLoad(true);
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const [entry] = entries;
+        if (!entry?.isIntersecting) {
+          return;
+        }
+        setShouldLoad(true);
+        observer.disconnect();
+      },
+      {
+        rootMargin: "240px 0px",
+      },
+    );
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [shouldLoad, thumbnail]);
+
+  return (
+    <div
+      ref={containerRef}
+      style={{
+        width: "100%",
+        height: "100%",
+        borderRadius: 6,
+        position: "relative",
+        overflow: "hidden",
+        background: thumbnail && shouldLoad && !imageFailed
+          ? "rgba(255,255,255,0.03)"
+          : `linear-gradient(${135 + index * 20}deg, ${colors[0]}, ${colors[1]}, ${colors[2]})`,
+      }}
+    >
+      {thumbnail && shouldLoad && !imageFailed ? (
         <img
           src={thumbnail}
           alt=""
@@ -100,45 +136,41 @@ function ClipThumbnail({ type, index, thumbnail }) {
             filter: "saturate(0.92) contrast(1.02)",
           }}
         />
-      </div>
-    );
-  }
-
-  return (
-    <div
-      style={{
-        width: "100%",
-        height: "100%",
-        borderRadius: 6,
-        background: `linear-gradient(${135 + index * 20}deg, ${colors[0]}, ${colors[1]}, ${colors[2]})`,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        position: "relative",
-        overflow: "hidden",
-      }}
-    >
-      <div
-        style={{
-          position: "absolute",
-          inset: 0,
-          background:
-            "repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,0.05) 3px, rgba(0,0,0,0.05) 4px)",
-        }}
-      />
-      <svg width="20" height="14" viewBox="0 0 20 14" fill="none">
-        <rect
-          x="1"
-          y="1"
-          width="18"
-          height="12"
-          rx="2"
-          stroke="rgba(255,255,255,0.25)"
-          strokeWidth="1.5"
-          fill="none"
-        />
-        <polygon points="8,4 14,7 8,10" fill="rgba(255,255,255,0.25)" />
-      </svg>
+      ) : (
+        <>
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              background:
+                "repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,0.05) 3px, rgba(0,0,0,0.05) 4px)",
+            }}
+          />
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <svg width="20" height="14" viewBox="0 0 20 14" fill="none">
+              <rect
+                x="1"
+                y="1"
+                width="18"
+                height="12"
+                rx="2"
+                stroke="rgba(255,255,255,0.25)"
+                strokeWidth="1.5"
+                fill="none"
+              />
+              <polygon points="8,4 14,7 8,10" fill="rgba(255,255,255,0.25)" />
+            </svg>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -253,6 +285,19 @@ function TypeBadge({ type }) {
   );
 }
 
+function mergeLiveClipItems(currentItems, nextItem, limit = 18) {
+  const merged = [nextItem, ...currentItems.filter((item) => item.id !== nextItem.id)];
+  return merged.slice(0, limit);
+}
+
+function mergeResultsWithLiveItems(results, liveItems) {
+  if (!liveItems.length) {
+    return results;
+  }
+  const liveIds = new Set(liveItems.map((item) => item.id));
+  return [...liveItems, ...results.filter((item) => !liveIds.has(item.id))];
+}
+
 function SearchIcon() {
   return (
     <svg
@@ -305,7 +350,10 @@ function ClipRow({ clip, index, isSelected, onSelect, onJump }) {
   const [hovered, setHovered] = useState(false);
   return (
     <div
-      onClick={() => onSelect(clip.id)}
+      onClick={() => {
+        onSelect(clip.id);
+        onJump(clip);
+      }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
@@ -466,6 +514,8 @@ export default function ResolveClipSearch() {
   const [selectedTimelineUids, setSelectedTimelineUids] = useState([]);
   const [indexScopeOpen, setIndexScopeOpen] = useState(false);
   const [results, setResults] = useState([]);
+  const [liveClips, setLiveClips] = useState([]);
+  const [liveSearchTick, setLiveSearchTick] = useState(0);
   const [renderCount, setRenderCount] = useState(INITIAL_RESULT_BATCH);
   const [status, setStatus] = useState({
     connected: false,
@@ -487,6 +537,11 @@ export default function ResolveClipSearch() {
       running: false,
       progress: 0,
       message: null,
+      finished_at: null,
+      active_clip_index: 0,
+      active_clip_name: null,
+      latest_clip: null,
+      latest_clip_stage: null,
     },
   });
   const [toast, setToast] = useState(null);
@@ -506,11 +561,18 @@ export default function ResolveClipSearch() {
   const selectedTimelineOptions = selectedTimelineUids
     .map((timelineUid) => timelineOptionsByKey.get(timelineUid))
     .filter(Boolean);
-  const visibleResults = results.slice(0, renderCount);
   const indexScopeLabel = summarizeTimelineSelection(selectedTimelineOptions);
   const indexScopeTitle = selectedTimelineOptions.length
     ? selectedTimelineOptions.map((option) => option.timeline_name).join(", ")
     : "Index the full project";
+  const shouldStreamIntoMainResults = !query.trim() && activeFilter === "All" && searchScope === "all";
+  const displayedResults = shouldStreamIntoMainResults && status.reindex.running
+    ? mergeResultsWithLiveItems(results, liveClips)
+    : results;
+  const visibleResults = displayedResults.slice(0, renderCount);
+  const canLiveRefreshSearch = Boolean(
+    query.trim() || searchScope === "current" || activeFilter !== "All" || (results.length > 0 && results.length <= 250),
+  );
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -580,6 +642,72 @@ export default function ResolveClipSearch() {
   }, []);
 
   useEffect(() => {
+    const stream = new EventSource("/api/reindex/stream");
+
+    stream.onmessage = (event) => {
+      if (!event.data) return;
+      try {
+        const nextState = JSON.parse(event.data);
+        setStatus((current) => ({
+          ...current,
+          reindex: {
+            ...current.reindex,
+            ...nextState,
+          },
+        }));
+      } catch {
+        // Keep the polling fallback if the stream sends malformed data.
+      }
+    };
+
+    return () => stream.close();
+  }, []);
+
+  useEffect(() => {
+    if (!status.reindex.running) {
+      setLiveClips([]);
+      return;
+    }
+    if (!status.reindex.latest_clip) {
+      return;
+    }
+    const nextLiveClip = {
+      ...status.reindex.latest_clip,
+      liveStage: status.reindex.latest_clip_stage,
+    };
+    setLiveClips((current) => mergeLiveClipItems(current, nextLiveClip));
+  }, [
+    status.reindex.latest_clip,
+    status.reindex.latest_clip_stage,
+    status.reindex.running,
+    status.reindex.started_at,
+  ]);
+
+  useEffect(() => {
+    if (!status.reindex.running) {
+      if (status.reindex.finished_at) {
+        setLiveSearchTick((current) => current + 1);
+      }
+      return undefined;
+    }
+    if (!canLiveRefreshSearch) {
+      return undefined;
+    }
+
+    const timerId = window.setTimeout(() => {
+      setLiveSearchTick((current) => current + 1);
+    }, 750);
+
+    return () => window.clearTimeout(timerId);
+  }, [
+    canLiveRefreshSearch,
+    status.reindex.finished_at,
+    status.reindex.message,
+    status.reindex.processed_clips,
+    status.reindex.running,
+  ]);
+
+  useEffect(() => {
     let cancelled = false;
     const controller = new AbortController();
     searchAbortRef.current?.abort?.();
@@ -621,34 +749,34 @@ export default function ResolveClipSearch() {
       controller.abort();
       window.clearTimeout(timerId);
     };
-  }, [query, activeFilter, searchScope, status.current_timeline_uid]);
+  }, [query, activeFilter, searchScope, status.current_timeline_uid, liveSearchTick]);
 
   useEffect(() => {
-    if (!results.length) {
+    if (!displayedResults.length) {
       setRenderCount(INITIAL_RESULT_BATCH);
       setSelectedId(null);
       return;
     }
-    setRenderCount(Math.min(INITIAL_RESULT_BATCH, results.length));
-    if (selectedId && results.some((clip) => clip.id === selectedId)) {
+    setRenderCount(Math.min(INITIAL_RESULT_BATCH, displayedResults.length));
+    if (selectedId && displayedResults.some((clip) => clip.id === selectedId)) {
       return;
     }
-    setSelectedId(results[0].id);
-  }, [results, selectedId]);
+    setSelectedId(displayedResults[0].id);
+  }, [displayedResults, selectedId]);
 
   useEffect(() => {
-    const selectedIndex = results.findIndex((clip) => clip.id === selectedId);
-    if (selectedIndex < 0 || renderCount >= results.length) {
+    const selectedIndex = displayedResults.findIndex((clip) => clip.id === selectedId);
+    if (selectedIndex < 0 || renderCount >= displayedResults.length) {
       return;
     }
     if (selectedIndex >= renderCount - 6) {
-      setRenderCount((current) => Math.min(current + RESULT_BATCH_SIZE, results.length));
+      setRenderCount((current) => Math.min(current + RESULT_BATCH_SIZE, displayedResults.length));
     }
-  }, [renderCount, results, selectedId]);
+  }, [displayedResults, renderCount, selectedId]);
 
   useEffect(() => {
     const node = loadMoreRef.current;
-    if (!node || renderCount >= results.length) {
+    if (!node || renderCount >= displayedResults.length) {
       return undefined;
     }
 
@@ -658,7 +786,7 @@ export default function ResolveClipSearch() {
         if (!entry?.isIntersecting) {
           return;
         }
-        setRenderCount((current) => Math.min(current + RESULT_BATCH_SIZE, results.length));
+        setRenderCount((current) => Math.min(current + RESULT_BATCH_SIZE, displayedResults.length));
       },
       {
         rootMargin: "400px 0px",
@@ -667,7 +795,7 @@ export default function ResolveClipSearch() {
 
     observer.observe(node);
     return () => observer.disconnect();
-  }, [renderCount, results.length]);
+  }, [displayedResults.length, renderCount]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -751,26 +879,26 @@ export default function ResolveClipSearch() {
         return;
       }
 
-      if (!results.length) return;
+      if (!displayedResults.length) return;
 
       if (event.key === "ArrowDown") {
         event.preventDefault();
-        const currentIndex = results.findIndex((clip) => clip.id === selectedId);
-        const nextIndex = currentIndex < 0 ? 0 : Math.min(currentIndex + 1, results.length - 1);
-        setSelectedId(results[nextIndex].id);
+        const currentIndex = displayedResults.findIndex((clip) => clip.id === selectedId);
+        const nextIndex = currentIndex < 0 ? 0 : Math.min(currentIndex + 1, displayedResults.length - 1);
+        setSelectedId(displayedResults[nextIndex].id);
       }
 
       if (event.key === "ArrowUp") {
         event.preventDefault();
-        const currentIndex = results.findIndex((clip) => clip.id === selectedId);
+        const currentIndex = displayedResults.findIndex((clip) => clip.id === selectedId);
         const nextIndex = currentIndex <= 0 ? 0 : currentIndex - 1;
-        setSelectedId(results[nextIndex].id);
+        setSelectedId(displayedResults[nextIndex].id);
       }
 
       if (event.key === "Enter") {
         if (event.metaKey || event.ctrlKey) return;
         event.preventDefault();
-        const target = results.find((clip) => clip.id === selectedId) || results[0];
+        const target = displayedResults.find((clip) => clip.id === selectedId) || displayedResults[0];
         if (target) {
           handleJump(target);
         }
@@ -779,7 +907,7 @@ export default function ResolveClipSearch() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [results, selectedId, query, indexScopeOpen]);
+  }, [displayedResults, selectedId, query, indexScopeOpen]);
 
   function handleTimelineToggle(timelineUid) {
     setSelectedTimelineUids((current) => {
@@ -800,6 +928,16 @@ export default function ResolveClipSearch() {
       ? "index stale"
       : `indexed ${formatRelativeTime(status.index.last_indexed)}`;
   const currentTimelineAvailable = Boolean(status.current_timeline_uid);
+  const reindexProgress = Math.max(0, Math.min(status.reindex.progress || 0, 1));
+  const reindexPercent = Math.round(reindexProgress * 100);
+  const reindexFillPercent = status.reindex.running
+    ? Math.max(reindexPercent, status.reindex.active_clip_index ? 1 : 0)
+    : reindexPercent;
+  const reindexDetail = status.reindex.active_clip_name
+    ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete · clip ${status.reindex.active_clip_index} in progress`
+    : status.reindex.total_clips
+      ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete`
+      : "Preparing timeline scan";
 
   return (
     <div
@@ -1171,6 +1309,92 @@ export default function ResolveClipSearch() {
           </div>
         </div>
 
+        {status.reindex.running && (
+          <div
+            style={{
+              marginBottom: 14,
+              padding: "8px 10px 9px",
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.06)",
+              background: "rgba(255,255,255,0.02)",
+              animation: "fadeSlideIn 0.24s ease both",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                marginBottom: 6,
+                fontSize: 10,
+                color: "rgba(255,255,255,0.42)",
+                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                letterSpacing: "0.03em",
+              }}
+            >
+              <span
+                style={{
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {status.reindex.message || "Indexing"}
+              </span>
+              <span>{reindexFillPercent}%</span>
+            </div>
+            <div
+              style={{
+                height: 4,
+                borderRadius: 999,
+                background: "rgba(255,255,255,0.06)",
+                overflow: "hidden",
+                boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.02)",
+              }}
+            >
+              <div
+                style={{
+                  width: `${reindexFillPercent}%`,
+                  minWidth: status.reindex.running ? 6 : 0,
+                  height: "100%",
+                  borderRadius: 999,
+                  background:
+                    "linear-gradient(90deg, rgba(99,196,130,0.45), rgba(99,196,130,0.92))",
+                  boxShadow: "0 0 16px rgba(99,196,130,0.2)",
+                  transition: "width 0.18s linear",
+                }}
+              />
+            </div>
+            <div
+              style={{
+                marginTop: 7,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                fontSize: 10,
+                color: "rgba(255,255,255,0.22)",
+                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                letterSpacing: "0.02em",
+              }}
+            >
+              <span
+                style={{
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {reindexDetail}
+              </span>
+              {status.reindex.current_timeline && <span>{status.reindex.current_timeline}</span>}
+            </div>
+          </div>
+        )}
+
         <div
           style={{
             display: "flex",
@@ -1325,13 +1549,48 @@ export default function ResolveClipSearch() {
               alignSelf: "center",
             }}
           >
-            {results.length} result{results.length !== 1 ? "s" : ""}
+            {displayedResults.length} result{displayedResults.length !== 1 ? "s" : ""}
           </span>
         </div>
       </div>
 
       <div>
-        {results.length === 0 ? (
+        {status.reindex.running && liveClips.length > 0 && !shouldStreamIntoMainResults && (
+          <div style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}>
+            <div
+              style={{
+                padding: "12px 16px 10px",
+                color: "rgba(255,255,255,0.24)",
+                fontSize: 10,
+                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                letterSpacing: "0.04em",
+                textTransform: "uppercase",
+              }}
+            >
+              Live Indexed Clips
+            </div>
+            {liveClips.slice(0, 6).map((clip, index) => (
+              <div
+                key={`live-${clip.id}`}
+                style={{
+                  borderTop: "1px solid rgba(255,255,255,0.03)",
+                  contentVisibility: "auto",
+                  containIntrinsicSize: "112px",
+                }}
+              >
+                <ClipRow
+                  clip={clip}
+                  index={index}
+                  isSelected={selectedId === clip.id}
+                  onSelect={setSelectedId}
+                  onJump={handleJump}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {displayedResults.length === 0 ? (
           <div
             style={{
               padding: "60px 20px",

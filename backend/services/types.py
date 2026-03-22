@@ -51,6 +51,7 @@ class VisionAnalysis:
 class ClipRecord:
     clip_id: str
     content_signature: str
+    vision_cache_signature: str
     project_uid: str
     timeline_uid: str
     timeline_name: str
@@ -117,7 +118,11 @@ class ReindexState:
     current_timeline: str | None = None
     processed_clips: int = 0
     total_clips: int = 0
+    active_clip_index: int = 0
+    active_clip_name: str | None = None
     quick_mode: bool = False
+    latest_clip: dict[str, Any] | None = None
+    latest_clip_stage: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,5 +135,9 @@ class ReindexState:
             "current_timeline": self.current_timeline,
             "processed_clips": self.processed_clips,
             "total_clips": self.total_clips,
+            "active_clip_index": self.active_clip_index,
+            "active_clip_name": self.active_clip_name,
             "quick_mode": self.quick_mode,
+            "latest_clip": self.latest_clip,
+            "latest_clip_stage": self.latest_clip_stage,
         }

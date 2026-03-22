@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+import queue
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import get_settings
@@ -62,8 +64,12 @@ def health() -> HealthModel:
 
 @app.get("/api/status", response_model=StatusResponseModel)
 def status() -> StatusResponseModel:
-    resolve_status = resolve.get_status()
     reindex_state = reindexer.snapshot()
+    resolve_status = (
+        resolve.get_cached_status()
+        if reindex_state.running
+        else resolve.get_status()
+    )
     stats = store.get_stats()
     is_stale = False
     project_coverage = None
@@ -268,6 +274,32 @@ def reindex(request: ReindexRequestModel) -> ReindexStateModel:
     except ResolveConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return ReindexStateModel(**state.to_dict())
+
+
+@app.get("/api/reindex/stream", response_model=None)
+def reindex_stream() -> StreamingResponse:
+    listener = reindexer.subscribe()
+
+    def event_stream():
+        try:
+            while True:
+                try:
+                    payload = listener.get(timeout=15)
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                yield f"data: {json.dumps(payload)}\n\n"
+        finally:
+            reindexer.unsubscribe(listener)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/jump", response_model=JumpResponseModel)

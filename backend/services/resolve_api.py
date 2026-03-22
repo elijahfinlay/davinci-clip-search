@@ -7,7 +7,7 @@ import os
 import platform
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -113,6 +113,11 @@ class ResolveStatus:
 class ResolveFacade:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._status_lock = threading.Lock()
+        self._cached_status = ResolveStatus(
+            connected=False,
+            message="Resolve status unavailable.",
+        )
 
     def _connect(self) -> tuple[Any, Any, Any]:
         module = _bootstrap_resolve_module()
@@ -137,6 +142,10 @@ class ResolveFacade:
             resolve, project_manager, project = self._connect()
             return callback(resolve, project_manager, project)
 
+    def get_cached_status(self) -> ResolveStatus:
+        with self._status_lock:
+            return replace(self._cached_status)
+
     def get_status(self) -> ResolveStatus:
         try:
             def _read(resolve: Any, _project_manager: Any, project: Any) -> ResolveStatus:
@@ -152,9 +161,15 @@ class ResolveFacade:
                     version_string=safe_call(resolve.GetVersionString),
                 )
 
-            return self.with_project(_read)
+            status = self.with_project(_read)
+            with self._status_lock:
+                self._cached_status = status
+            return status
         except ResolveConnectionError as exc:
-            return ResolveStatus(connected=False, message=str(exc))
+            status = ResolveStatus(connected=False, message=str(exc))
+            with self._status_lock:
+                self._cached_status = status
+            return status
 
     def compute_project_signature(self) -> dict[str, Any]:
         def _build(_resolve: Any, _project_manager: Any, project: Any) -> dict[str, Any]:

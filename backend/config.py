@@ -27,6 +27,9 @@ class Settings:
     vision_model: str
     vision_max_image_edge_px: int
     vision_timeout_sec: float
+    yolo_world_model: str
+    yolo_world_confidence: float
+    yolo_world_max_objects: int
     thumbnail_cache_version: str
     thumbnail_source_width: int
     thumbnail_source_height: int
@@ -119,6 +122,16 @@ def get_settings() -> Settings:
         ),
         vision_timeout_sec=float(
             os.getenv("RESOLVE_CLIP_SEARCH_VISION_TIMEOUT_SEC", "60")
+        ),
+        yolo_world_model=os.getenv(
+            "RESOLVE_CLIP_SEARCH_YOLO_WORLD_MODEL",
+            "yolov8s-worldv2.pt",
+        ),
+        yolo_world_confidence=float(
+            os.getenv("RESOLVE_CLIP_SEARCH_YOLO_WORLD_CONFIDENCE", "0.18")
+        ),
+        yolo_world_max_objects=int(
+            os.getenv("RESOLVE_CLIP_SEARCH_YOLO_WORLD_MAX_OBJECTS", "14")
         ),
         thumbnail_cache_version=os.getenv(
             "RESOLVE_CLIP_SEARCH_THUMBNAIL_CACHE_VERSION",
