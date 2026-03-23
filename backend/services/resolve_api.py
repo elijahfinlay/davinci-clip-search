@@ -247,74 +247,101 @@ class ResolveFacade:
         track_index: int | None = None,
     ) -> dict[str, Any]:
         def _jump(resolve: Any, _project_manager: Any, project: Any) -> dict[str, Any]:
-            timeline_count = safe_call(project.GetTimelineCount, default=0) or 0
-            preferred_timelines: list[tuple[Any, str | None, str]] = []
-            other_timelines: list[tuple[Any, str | None, str]] = []
-            fallback_timeline = None
-            for timeline_index in range(1, timeline_count + 1):
-                timeline = safe_call(project.GetTimelineByIndex, timeline_index)
-                if not timeline:
-                    continue
-                candidate_uid = safe_call(timeline.GetUniqueId)
-                candidate_name = safe_call(timeline.GetName) or f"Timeline {timeline_index}"
-                if timeline_uid and candidate_uid == timeline_uid:
-                    preferred_timelines.insert(0, (timeline, candidate_uid, candidate_name))
-                    fallback_timeline = timeline
-                    continue
-                if candidate_name == timeline_name:
-                    preferred_timelines.append((timeline, candidate_uid, candidate_name))
-                    fallback_timeline = fallback_timeline or timeline
-                    continue
-                other_timelines.append((timeline, candidate_uid, candidate_name))
-
-            if not fallback_timeline and preferred_timelines:
-                fallback_timeline = preferred_timelines[0][0]
-
-            if not fallback_timeline:
-                raise ResolveConnectionError(
-                    f'Unable to find timeline "{timeline_name}" in the current project.'
-                )
-
-            resolved_target = self._find_live_clip_location(
+            return self.jump_to_clip_in_project(
+                resolve=resolve,
                 project=project,
-                timelines=preferred_timelines + other_timelines,
                 clip_id=clip_id,
+                timeline_uid=timeline_uid,
+                timeline_name=timeline_name,
+                start_timecode=start_timecode,
                 clip_name=clip_name,
                 file_path=file_path,
                 duration_frames=duration_frames,
                 track_index=track_index,
-                indexed_start_timecode=start_timecode,
             )
-
-            target_timeline = resolved_target["timeline"] if resolved_target else fallback_timeline
-            target_timeline_name = (
-                resolved_target["timeline_name"] if resolved_target else timeline_name
-            )
-            target_timecode = (
-                resolved_target["start_timecode"] if resolved_target else start_timecode
-            )
-
-            if not safe_call(project.SetCurrentTimeline, target_timeline, default=False):
-                raise ResolveConnectionError(
-                    f'Failed to switch Resolve to timeline "{target_timeline_name}".'
-                )
-
-            safe_call(resolve.OpenPage, "edit", default=False)
-            if not safe_call(
-                target_timeline.SetCurrentTimecode,
-                target_timecode,
-                default=False,
-            ):
-                raise ResolveConnectionError(
-                    f'Failed to move the playhead to {target_timecode} in "{target_timeline_name}".'
-                )
-
-            return {
-                "timeline_name": target_timeline_name,
-                "start_timecode": target_timecode,
-            }
 
         return self.with_project(_jump)
+
+    def jump_to_clip_in_project(
+        self,
+        *,
+        resolve: Any,
+        project: Any,
+        clip_id: str,
+        timeline_uid: str | None,
+        timeline_name: str,
+        start_timecode: str,
+        clip_name: str | None = None,
+        file_path: str | None = None,
+        duration_frames: int | None = None,
+        track_index: int | None = None,
+    ) -> dict[str, Any]:
+        timeline_count = safe_call(project.GetTimelineCount, default=0) or 0
+        preferred_timelines: list[tuple[Any, str | None, str]] = []
+        other_timelines: list[tuple[Any, str | None, str]] = []
+        fallback_timeline = None
+        for timeline_index in range(1, timeline_count + 1):
+            timeline = safe_call(project.GetTimelineByIndex, timeline_index)
+            if not timeline:
+                continue
+            candidate_uid = safe_call(timeline.GetUniqueId)
+            candidate_name = safe_call(timeline.GetName) or f"Timeline {timeline_index}"
+            if timeline_uid and candidate_uid == timeline_uid:
+                preferred_timelines.insert(0, (timeline, candidate_uid, candidate_name))
+                fallback_timeline = timeline
+                continue
+            if candidate_name == timeline_name:
+                preferred_timelines.append((timeline, candidate_uid, candidate_name))
+                fallback_timeline = fallback_timeline or timeline
+                continue
+            other_timelines.append((timeline, candidate_uid, candidate_name))
+
+        if not fallback_timeline and preferred_timelines:
+            fallback_timeline = preferred_timelines[0][0]
+
+        if not fallback_timeline:
+            raise ResolveConnectionError(
+                f'Unable to find timeline "{timeline_name}" in the current project.'
+            )
+
+        resolved_target = self._find_live_clip_location(
+            project=project,
+            timelines=preferred_timelines + other_timelines,
+            clip_id=clip_id,
+            clip_name=clip_name,
+            file_path=file_path,
+            duration_frames=duration_frames,
+            track_index=track_index,
+            indexed_start_timecode=start_timecode,
+        )
+
+        target_timeline = resolved_target["timeline"] if resolved_target else fallback_timeline
+        target_timeline_name = (
+            resolved_target["timeline_name"] if resolved_target else timeline_name
+        )
+        target_timecode = (
+            resolved_target["start_timecode"] if resolved_target else start_timecode
+        )
+
+        if not safe_call(project.SetCurrentTimeline, target_timeline, default=False):
+            raise ResolveConnectionError(
+                f'Failed to switch Resolve to timeline "{target_timeline_name}".'
+            )
+
+        safe_call(resolve.OpenPage, "edit", default=False)
+        if not safe_call(
+            target_timeline.SetCurrentTimecode,
+            target_timecode,
+            default=False,
+        ):
+            raise ResolveConnectionError(
+                f'Failed to move the playhead to {target_timecode} in "{target_timeline_name}".'
+            )
+
+        return {
+            "timeline_name": target_timeline_name,
+            "start_timecode": target_timecode,
+        }
 
     def _find_live_clip_location(
         self,

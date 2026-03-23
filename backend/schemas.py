@@ -64,7 +64,9 @@ class IndexStatsModel(BaseModel):
 
 class ReindexStateModel(BaseModel):
     running: bool = False
+    enrichment_running: bool = False
     progress: float = 0.0
+    enrichment_progress: float = 0.0
     message: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
@@ -72,6 +74,8 @@ class ReindexStateModel(BaseModel):
     current_timeline: str | None = None
     processed_clips: int = 0
     total_clips: int = 0
+    enriched_clips: int = 0
+    total_enrichment_clips: int = 0
     active_clip_index: int = 0
     active_clip_name: str | None = None
     quick_mode: bool = False

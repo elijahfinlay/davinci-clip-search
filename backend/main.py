@@ -276,6 +276,12 @@ def reindex(request: ReindexRequestModel) -> ReindexStateModel:
     return ReindexStateModel(**state.to_dict())
 
 
+@app.post("/api/reindex/cancel", response_model=ReindexStateModel)
+def cancel_reindex() -> ReindexStateModel:
+    state = reindexer.cancel()
+    return ReindexStateModel(**state.to_dict())
+
+
 @app.get("/api/reindex/stream", response_model=None)
 def reindex_stream() -> StreamingResponse:
     listener = reindexer.subscribe()
@@ -308,20 +314,20 @@ def jump(request: JumpRequestModel) -> JumpResponseModel:
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found in the local index.")
 
-    if reindexer.snapshot().running:
-        raise HTTPException(status_code=409, detail="Reindexing is in progress. Wait for it to finish before jumping.")
-
     try:
-        result = resolve.jump_to_clip(
-            clip_id=clip["clip_id"],
-            timeline_uid=clip["timeline_uid"],
-            timeline_name=clip["timeline_name"],
-            start_timecode=clip["start_timecode"],
-            clip_name=clip["clip_name"],
-            file_path=clip["file_path"],
-            duration_frames=clip["duration_frames"],
-            track_index=clip["track"],
-        )
+        if reindexer.snapshot().running:
+            result = reindexer.request_jump(clip)
+        else:
+            result = resolve.jump_to_clip(
+                clip_id=clip["clip_id"],
+                timeline_uid=clip["timeline_uid"],
+                timeline_name=clip["timeline_name"],
+                start_timecode=clip["start_timecode"],
+                clip_name=clip["clip_name"],
+                file_path=clip["file_path"],
+                duration_frames=clip["duration_frames"],
+                track_index=clip["track"],
+            )
     except ResolveConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

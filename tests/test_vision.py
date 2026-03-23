@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from backend.services.vision import (
+    _closest_frame,
     ExtractedFrame,
     _guided_analysis_from_response,
     _merge_guided_summary,
@@ -19,6 +20,16 @@ class VisionPipelineTests(unittest.TestCase):
     def test_middle_offset_uses_clip_midpoint(self) -> None:
         self.assertEqual(_single_middle_offset(18.0), 9.0)
         self.assertEqual(_single_middle_offset(0.0), 0.0)
+
+    def test_closest_frame_prefers_sampled_midpoint(self) -> None:
+        frames = [
+            ExtractedFrame(frame_offset_sec=2.0, image_bytes=b"a"),
+            ExtractedFrame(frame_offset_sec=6.0, image_bytes=b"b"),
+            ExtractedFrame(frame_offset_sec=10.0, image_bytes=b"c"),
+        ]
+        frame = _closest_frame(frames, target_offset_sec=6.1)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.frame_offset_sec, 6.0)
 
     def test_merge_guided_summary_includes_objects(self) -> None:
         summary = _merge_guided_summary(

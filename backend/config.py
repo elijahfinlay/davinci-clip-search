@@ -27,6 +27,7 @@ class Settings:
     vision_model: str
     vision_max_image_edge_px: int
     vision_timeout_sec: float
+    gemini_max_attempts: int
     yolo_world_model: str
     yolo_world_confidence: float
     yolo_world_max_objects: int
@@ -122,6 +123,10 @@ def get_settings() -> Settings:
         ),
         vision_timeout_sec=float(
             os.getenv("RESOLVE_CLIP_SEARCH_VISION_TIMEOUT_SEC", "60")
+        ),
+        gemini_max_attempts=max(
+            int(os.getenv("RESOLVE_CLIP_SEARCH_GEMINI_MAX_ATTEMPTS", "1")),
+            1,
         ),
         yolo_world_model=os.getenv(
             "RESOLVE_CLIP_SEARCH_YOLO_WORLD_MODEL",

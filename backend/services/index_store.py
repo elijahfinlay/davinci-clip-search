@@ -69,6 +69,7 @@ class IndexStore:
                     has_audio INTEGER NOT NULL DEFAULT 0,
                     description TEXT,
                     transcript TEXT,
+                    detected_objects_json TEXT NOT NULL DEFAULT '[]',
                     tags_json TEXT NOT NULL,
                     markers_json TEXT NOT NULL,
                     timeline_markers_json TEXT NOT NULL,
@@ -95,6 +96,10 @@ class IndexStore:
                 conn.execute("ALTER TABLE clips ADD COLUMN content_signature TEXT")
             if "vision_cache_signature" not in columns:
                 conn.execute("ALTER TABLE clips ADD COLUMN vision_cache_signature TEXT")
+            if "detected_objects_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE clips ADD COLUMN detected_objects_json TEXT NOT NULL DEFAULT '[]'"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_clips_content_signature ON clips(content_signature)"
             )
@@ -186,6 +191,7 @@ class IndexStore:
         query = """
             SELECT clip_id, content_signature, source_signature, tags_json,
                    vision_cache_signature, visual_descriptions_json, description, transcript, clip_type,
+                   detected_objects_json,
                    thumbnail_data
             FROM clips
             WHERE project_uid = ?
@@ -325,10 +331,10 @@ class IndexStore:
                     clip_name, file_path, file_name, track, track_name, item_index,
                     start_frame, end_frame, duration_frames, duration_seconds, fps,
                     start_timecode, end_timecode, source_in, source_out, resolution, codec,
-                    clip_color, clip_type, has_audio, description, transcript,
+                    clip_color, clip_type, has_audio, description, transcript, detected_objects_json,
                     tags_json, markers_json, timeline_markers_json, visual_descriptions_json,
                     searchable_text, source_signature, thumbnail_data, indexed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(clip_id) DO UPDATE SET
                     content_signature = excluded.content_signature,
                     vision_cache_signature = excluded.vision_cache_signature,
@@ -358,6 +364,7 @@ class IndexStore:
                     has_audio = excluded.has_audio,
                     description = excluded.description,
                     transcript = excluded.transcript,
+                    detected_objects_json = excluded.detected_objects_json,
                     tags_json = excluded.tags_json,
                     markers_json = excluded.markers_json,
                     timeline_markers_json = excluded.timeline_markers_json,
@@ -555,10 +562,10 @@ class IndexStore:
                         clip_name, file_path, file_name, track, track_name, item_index,
                         start_frame, end_frame, duration_frames, duration_seconds, fps,
                         start_timecode, end_timecode, source_in, source_out, resolution, codec,
-                        clip_color, clip_type, has_audio, description, transcript,
+                        clip_color, clip_type, has_audio, description, transcript, detected_objects_json,
                         tags_json, markers_json, timeline_markers_json, visual_descriptions_json,
                         searchable_text, source_signature, thumbnail_data, indexed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(clip_id) DO UPDATE SET
                         content_signature = excluded.content_signature,
                         vision_cache_signature = excluded.vision_cache_signature,
@@ -588,6 +595,7 @@ class IndexStore:
                         has_audio = excluded.has_audio,
                         description = excluded.description,
                         transcript = excluded.transcript,
+                        detected_objects_json = excluded.detected_objects_json,
                         tags_json = excluded.tags_json,
                         markers_json = excluded.markers_json,
                         timeline_markers_json = excluded.timeline_markers_json,
@@ -673,6 +681,7 @@ class IndexStore:
             int(clip.has_audio),
             clip.description,
             clip.transcript,
+            json.dumps(clip.detected_objects),
             json.dumps(clip.tags),
             json.dumps([marker.to_dict() for marker in clip.markers]),
             json.dumps([marker.to_dict() for marker in clip.timeline_markers]),
@@ -743,6 +752,7 @@ class IndexStore:
         if row is None:
             return {}
         data = dict(row)
+        data["detected_objects"] = json.loads(data.pop("detected_objects_json"))
         data["tags"] = json.loads(data.pop("tags_json"))
         data["markers"] = json.loads(data.pop("markers_json"))
         data["timeline_markers"] = json.loads(data.pop("timeline_markers_json"))

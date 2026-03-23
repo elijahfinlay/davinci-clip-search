@@ -513,6 +513,7 @@ export default function ResolveClipSearch() {
   const [searchScope, setSearchScope] = useState("all");
   const [selectedTimelineUids, setSelectedTimelineUids] = useState([]);
   const [indexScopeOpen, setIndexScopeOpen] = useState(false);
+  const [timelineSearchQuery, setTimelineSearchQuery] = useState("");
   const [results, setResults] = useState([]);
   const [liveClips, setLiveClips] = useState([]);
   const [liveSearchTick, setLiveSearchTick] = useState(0);
@@ -535,9 +536,13 @@ export default function ResolveClipSearch() {
     },
     reindex: {
       running: false,
+      enrichment_running: false,
       progress: 0,
+      enrichment_progress: 0,
       message: null,
       finished_at: null,
+      enriched_clips: 0,
+      total_enrichment_clips: 0,
       active_clip_index: 0,
       active_clip_name: null,
       latest_clip: null,
@@ -548,7 +553,9 @@ export default function ResolveClipSearch() {
   const inputRef = useRef(null);
   const searchAbortRef = useRef(null);
   const indexScopeRef = useRef(null);
+  const timelineSearchInputRef = useRef(null);
   const loadMoreRef = useRef(null);
+  const hasInitializedTimelineSelectionRef = useRef(false);
 
   const filterOptions = normalizeFilterOptions(status.index.available_types);
   const timelineOptions = status.index.timeline_options || [];
@@ -561,12 +568,25 @@ export default function ResolveClipSearch() {
   const selectedTimelineOptions = selectedTimelineUids
     .map((timelineUid) => timelineOptionsByKey.get(timelineUid))
     .filter(Boolean);
+  const normalizedTimelineSearchQuery = timelineSearchQuery.trim().toLowerCase();
+  const filteredTimelineOptions = normalizedTimelineSearchQuery
+    ? timelineOptions.filter((option) =>
+        option.timeline_name.toLowerCase().includes(normalizedTimelineSearchQuery),
+      )
+    : timelineOptions;
   const indexScopeLabel = summarizeTimelineSelection(selectedTimelineOptions);
+  const selectedScopeClipTotal = selectedTimelineOptions.length
+    ? selectedTimelineOptions.reduce((sum, option) => sum + (option.total || 0), 0)
+    : (status.index.project_coverage?.total || status.index.total || 0);
+  const indexScopeCountLabel = `${selectedScopeClipTotal.toLocaleString()} clips`;
   const indexScopeTitle = selectedTimelineOptions.length
-    ? selectedTimelineOptions.map((option) => option.timeline_name).join(", ")
-    : "Index the full project";
+    ? `${selectedTimelineOptions.map((option) => option.timeline_name).join(", ")} • ${indexScopeCountLabel}`
+    : `Index the full project • ${indexScopeCountLabel}`;
+  const isBusy = status.reindex.running || status.reindex.enrichment_running;
+  const isEnriching = status.reindex.enrichment_running && !status.reindex.running;
+  const isStopping = isBusy && `${status.reindex.message || ""}`.toLowerCase().startsWith("stopping");
   const shouldStreamIntoMainResults = !query.trim() && activeFilter === "All" && searchScope === "all";
-  const displayedResults = shouldStreamIntoMainResults && status.reindex.running
+  const displayedResults = shouldStreamIntoMainResults && isBusy
     ? mergeResultsWithLiveItems(results, liveClips)
     : results;
   const visibleResults = displayedResults.slice(0, renderCount);
@@ -600,6 +620,29 @@ export default function ResolveClipSearch() {
   }, [timelineOptions]);
 
   useEffect(() => {
+    if (hasInitializedTimelineSelectionRef.current) {
+      return;
+    }
+    if (!status.current_timeline_uid || !timelineOptions.length) {
+      return;
+    }
+
+    const currentTimelineOption = timelineOptions.find(
+      (option) =>
+        (option.timeline_uid || option.timeline_name) === status.current_timeline_uid
+        || option.current,
+    );
+    if (!currentTimelineOption) {
+      return;
+    }
+
+    hasInitializedTimelineSelectionRef.current = true;
+    setSelectedTimelineUids([
+      currentTimelineOption.timeline_uid || currentTimelineOption.timeline_name,
+    ]);
+  }, [status.current_timeline_uid, timelineOptions]);
+
+  useEffect(() => {
     if (!indexScopeOpen) return undefined;
 
     function handlePointerDown(event) {
@@ -610,6 +653,20 @@ export default function ResolveClipSearch() {
 
     window.addEventListener("pointerdown", handlePointerDown);
     return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [indexScopeOpen]);
+
+  useEffect(() => {
+    if (!indexScopeOpen) {
+      setTimelineSearchQuery("");
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      timelineSearchInputRef.current?.focus();
+      timelineSearchInputRef.current?.select();
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
   }, [indexScopeOpen]);
 
   useEffect(() => {
@@ -664,7 +721,7 @@ export default function ResolveClipSearch() {
   }, []);
 
   useEffect(() => {
-    if (!status.reindex.running) {
+    if (!isBusy) {
       setLiveClips([]);
       return;
     }
@@ -679,12 +736,12 @@ export default function ResolveClipSearch() {
   }, [
     status.reindex.latest_clip,
     status.reindex.latest_clip_stage,
-    status.reindex.running,
+    isBusy,
     status.reindex.started_at,
   ]);
 
   useEffect(() => {
-    if (!status.reindex.running) {
+    if (!isBusy) {
       if (status.reindex.finished_at) {
         setLiveSearchTick((current) => current + 1);
       }
@@ -701,6 +758,10 @@ export default function ResolveClipSearch() {
     return () => window.clearTimeout(timerId);
   }, [
     canLiveRefreshSearch,
+    isBusy,
+    status.reindex.enriched_clips,
+    status.reindex.enrichment_progress,
+    status.reindex.enrichment_running,
     status.reindex.finished_at,
     status.reindex.message,
     status.reindex.processed_clips,
@@ -857,6 +918,27 @@ export default function ResolveClipSearch() {
     }
   }
 
+  async function handleCancelReindex() {
+    try {
+      const nextState = await request("/api/reindex/cancel", {
+        method: "POST",
+      });
+      setStatus((current) => ({
+        ...current,
+        reindex: nextState,
+      }));
+      setToast({
+        type: "success",
+        message: "Stopping current job...",
+      });
+    } catch (error) {
+      setToast({
+        type: "error",
+        message: error.message || "Unable to stop current job",
+      });
+    }
+  }
+
   useEffect(() => {
     function handleKeyDown(event) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -876,6 +958,10 @@ export default function ResolveClipSearch() {
           event.preventDefault();
           setQuery("");
         }
+        return;
+      }
+
+      if (indexScopeRef.current?.contains(document.activeElement)) {
         return;
       }
 
@@ -924,20 +1010,40 @@ export default function ResolveClipSearch() {
 
   const statusCopy = status.reindex.running
     ? `${status.reindex.message || "indexing"} ${Math.round((status.reindex.progress || 0) * 100)}%`
+    : status.reindex.enrichment_running
+      ? `${status.reindex.message || "enriching"} ${Math.round((status.reindex.enrichment_progress || 0) * 100)}%`
     : status.index.is_stale
       ? "index stale"
       : `indexed ${formatRelativeTime(status.index.last_indexed)}`;
   const currentTimelineAvailable = Boolean(status.current_timeline_uid);
-  const reindexProgress = Math.max(0, Math.min(status.reindex.progress || 0, 1));
+  const reindexProgress = Math.max(
+    0,
+    Math.min(
+      status.reindex.running
+        ? (status.reindex.progress || 0)
+        : (status.reindex.enrichment_progress || 0),
+      1,
+    ),
+  );
   const reindexPercent = Math.round(reindexProgress * 100);
-  const reindexFillPercent = status.reindex.running
+  const reindexFillPercent = isBusy
     ? Math.max(reindexPercent, status.reindex.active_clip_index ? 1 : 0)
     : reindexPercent;
-  const reindexDetail = status.reindex.active_clip_name
-    ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete · clip ${status.reindex.active_clip_index} in progress`
-    : status.reindex.total_clips
-      ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete`
-      : "Preparing timeline scan";
+  const reindexDetail = status.reindex.running
+    ? (
+        status.reindex.active_clip_name
+          ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete · clip ${status.reindex.active_clip_index} in progress`
+          : status.reindex.total_clips
+            ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete`
+            : "Preparing timeline scan"
+      )
+    : (
+        status.reindex.active_clip_name
+          ? `${status.reindex.enriched_clips}/${status.reindex.total_enrichment_clips} enriched · clip ${status.reindex.active_clip_index} in progress`
+          : status.reindex.total_enrichment_clips
+            ? `${status.reindex.enriched_clips}/${status.reindex.total_enrichment_clips} enriched`
+            : "Preparing Gemini enrichment"
+      );
 
   return (
     <div
@@ -1065,7 +1171,7 @@ export default function ResolveClipSearch() {
             <div ref={indexScopeRef} style={{ position: "relative" }}>
               <button
                 onClick={() => setIndexScopeOpen((open) => !open)}
-                disabled={status.reindex.running}
+                disabled={isBusy}
                 title={indexScopeTitle}
                 style={{
                   display: "flex",
@@ -1078,13 +1184,13 @@ export default function ResolveClipSearch() {
                   color: "rgba(255,255,255,0.3)",
                   fontSize: 10,
                   fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
-                  cursor: status.reindex.running ? "default" : "pointer",
+                  cursor: isBusy ? "default" : "pointer",
                   transition: "all 0.15s ease",
-                  opacity: status.reindex.running ? 0.55 : 1,
-                  maxWidth: 190,
+                  opacity: isBusy ? 0.55 : 1,
+                  maxWidth: 255,
                 }}
                 onMouseEnter={(event) => {
-                  if (status.reindex.running) return;
+                  if (isBusy) return;
                   event.currentTarget.style.borderColor = "rgba(255,255,255,0.15)";
                   event.currentTarget.style.color = "rgba(255,255,255,0.5)";
                 }}
@@ -1092,17 +1198,28 @@ export default function ResolveClipSearch() {
                   event.currentTarget.style.borderColor = "rgba(255,255,255,0.08)";
                   event.currentTarget.style.color = "rgba(255,255,255,0.3)";
                 }}
-              >
+                >
                 <span style={{ color: "rgba(255,255,255,0.18)" }}>Scope</span>
                 <span
                   style={{
                     minWidth: 0,
+                    flex: 1,
                     overflow: "hidden",
                     textOverflow: "ellipsis",
                     whiteSpace: "nowrap",
                   }}
                 >
                   {indexScopeLabel}
+                </span>
+                <span
+                  style={{
+                    color: "rgba(255,255,255,0.22)",
+                    fontSize: 9,
+                    flexShrink: 0,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {indexScopeCountLabel}
                 </span>
                 <span style={{ fontSize: 8, color: "rgba(255,255,255,0.18)" }}>▾</span>
               </button>
@@ -1167,6 +1284,27 @@ export default function ResolveClipSearch() {
                     }}
                   />
 
+                  <div style={{ padding: "0 4px 8px" }}>
+                    <input
+                      ref={timelineSearchInputRef}
+                      value={timelineSearchQuery}
+                      onChange={(event) => setTimelineSearchQuery(event.target.value)}
+                      placeholder="Search timelines..."
+                      style={{
+                        width: "100%",
+                        height: 32,
+                        borderRadius: 7,
+                        border: "1px solid rgba(255,255,255,0.07)",
+                        background: "rgba(255,255,255,0.03)",
+                        color: "rgba(255,255,255,0.78)",
+                        fontSize: 11,
+                        fontFamily: "'DM Sans', system-ui, sans-serif",
+                        padding: "0 10px",
+                        boxSizing: "border-box",
+                      }}
+                    />
+                  </div>
+
                   <div
                     style={{
                       maxHeight: 260,
@@ -1185,8 +1323,19 @@ export default function ResolveClipSearch() {
                       >
                         No timelines available
                       </div>
+                    ) : filteredTimelineOptions.length === 0 ? (
+                      <div
+                        style={{
+                          padding: "10px 8px",
+                          color: "rgba(255,255,255,0.25)",
+                          fontSize: 11,
+                          fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                        }}
+                      >
+                        No matching timelines
+                      </div>
                     ) : (
-                      timelineOptions.map((option) => {
+                      filteredTimelineOptions.map((option) => {
                         const timelineKey = option.timeline_uid || option.timeline_name;
                         const selected = selectedTimelineUids.includes(timelineKey);
                         return (
@@ -1278,7 +1427,7 @@ export default function ResolveClipSearch() {
             </div>
             <button
               onClick={handleReindex}
-              disabled={status.reindex.running}
+              disabled={isBusy}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -1290,12 +1439,12 @@ export default function ResolveClipSearch() {
                 color: "rgba(255,255,255,0.3)",
                 fontSize: 10,
                 fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
-                cursor: status.reindex.running ? "default" : "pointer",
+                cursor: isBusy ? "default" : "pointer",
                 transition: "all 0.15s ease",
-                opacity: status.reindex.running ? 0.55 : 1,
+                opacity: isBusy ? 0.55 : 1,
               }}
               onMouseEnter={(event) => {
-                if (status.reindex.running) return;
+                if (isBusy) return;
                 event.currentTarget.style.borderColor = "rgba(255,255,255,0.15)";
                 event.currentTarget.style.color = "rgba(255,255,255,0.5)";
               }}
@@ -1304,12 +1453,44 @@ export default function ResolveClipSearch() {
                 event.currentTarget.style.color = "rgba(255,255,255,0.3)";
               }}
             >
-              <IndexIcon /> {status.reindex.running ? "Reindexing" : "Reindex"}
+              <IndexIcon /> {status.reindex.running ? "Reindexing" : status.reindex.enrichment_running ? "Enriching" : "Reindex"}
             </button>
+            {isBusy && (
+              <button
+                onClick={handleCancelReindex}
+                disabled={isStopping}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  padding: "3px 8px",
+                  borderRadius: 4,
+                  border: "1px solid rgba(196,99,99,0.18)",
+                  background: "transparent",
+                  color: "rgba(216,124,124,0.72)",
+                  fontSize: 10,
+                  fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                  cursor: isStopping ? "default" : "pointer",
+                  transition: "all 0.15s ease",
+                  opacity: isStopping ? 0.6 : 1,
+                }}
+                onMouseEnter={(event) => {
+                  if (isStopping) return;
+                  event.currentTarget.style.borderColor = "rgba(216,124,124,0.34)";
+                  event.currentTarget.style.color = "rgba(236,148,148,0.9)";
+                }}
+                onMouseLeave={(event) => {
+                  event.currentTarget.style.borderColor = "rgba(196,99,99,0.18)";
+                  event.currentTarget.style.color = "rgba(216,124,124,0.72)";
+                }}
+              >
+                {isStopping ? "Stopping" : "Stop"}
+              </button>
+            )}
           </div>
         </div>
 
-        {status.reindex.running && (
+        {isBusy && (
           <div
             style={{
               marginBottom: 14,
@@ -1357,12 +1538,15 @@ export default function ResolveClipSearch() {
               <div
                 style={{
                   width: `${reindexFillPercent}%`,
-                  minWidth: status.reindex.running ? 6 : 0,
+                  minWidth: isBusy ? 6 : 0,
                   height: "100%",
                   borderRadius: 999,
-                  background:
-                    "linear-gradient(90deg, rgba(99,196,130,0.45), rgba(99,196,130,0.92))",
-                  boxShadow: "0 0 16px rgba(99,196,130,0.2)",
+                  background: isEnriching
+                    ? "linear-gradient(90deg, rgba(92,154,214,0.45), rgba(92,154,214,0.92))"
+                    : "linear-gradient(90deg, rgba(99,196,130,0.45), rgba(99,196,130,0.92))",
+                  boxShadow: isEnriching
+                    ? "0 0 16px rgba(92,154,214,0.2)"
+                    : "0 0 16px rgba(99,196,130,0.2)",
                   transition: "width 0.18s linear",
                 }}
               />
@@ -1555,7 +1739,7 @@ export default function ResolveClipSearch() {
       </div>
 
       <div>
-        {status.reindex.running && liveClips.length > 0 && !shouldStreamIntoMainResults && (
+        {isBusy && liveClips.length > 0 && !shouldStreamIntoMainResults && (
           <div style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}>
             <div
               style={{
@@ -1567,7 +1751,7 @@ export default function ResolveClipSearch() {
                 textTransform: "uppercase",
               }}
             >
-              Live Indexed Clips
+              Live Updated Clips
             </div>
             {liveClips.slice(0, 6).map((clip, index) => (
               <div

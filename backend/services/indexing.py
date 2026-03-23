@@ -5,6 +5,7 @@ import json
 import queue
 import re
 import threading
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +22,7 @@ from .types import (
     ProjectIndexMeta,
     ReindexState,
     TimelineRecord,
+    VisionAnalysis,
     VisualDescription,
 )
 from .vision import build_visual_analyzer
@@ -28,6 +30,29 @@ from .vision import build_visual_analyzer
 
 ProgressCallback = Callable[[ReindexState], None]
 PartialClipCallback = Callable[[ClipRecord, str], None]
+SessionActionCallback = Callable[[Any, Any], None]
+CancellationCallback = Callable[[], bool]
+
+
+@dataclass(slots=True)
+class EnrichmentTask:
+    clip: ClipRecord
+
+
+@dataclass(slots=True)
+class ClipBuildResult:
+    clip: ClipRecord
+    enrichment_task: EnrichmentTask | None = None
+
+
+@dataclass(slots=True)
+class IndexBuildResult:
+    project_meta: ProjectIndexMeta
+    enrichment_tasks: list[EnrichmentTask] = field(default_factory=list)
+
+
+class IndexingCancelledError(Exception):
+    pass
 
 
 def now_iso() -> str:
@@ -297,6 +322,118 @@ class IndexingService:
         self.resolve = resolve
         self.visual_analyzer = build_visual_analyzer(settings)
 
+    def _supports_background_enrichment(self, *, quick_mode: bool) -> bool:
+        if quick_mode:
+            return False
+        return bool(self.visual_analyzer.background_enrichment_enabled())
+
+    def _apply_analysis_to_clip(
+        self,
+        *,
+        clip: ClipRecord,
+        analysis: VisionAnalysis,
+    ) -> ClipRecord:
+        clip_type = analysis.clip_type_hint or clip.clip_type
+        tags = dedupe(clip.tags + analysis.tags + [clip_type])
+        visual_descriptions = analysis.frame_descriptions or clip.visual_descriptions
+        description = analysis.summary.strip() or clip.description
+        if not description:
+            description = build_description(
+                clip_name=clip.clip_name,
+                clip_type=clip_type,
+                timeline_name=clip.timeline_name,
+                track_name=clip.track_name,
+                tags=tags,
+                transcript=clip.transcript,
+                visual_descriptions=visual_descriptions,
+            )
+
+        searchable_text = build_searchable_text(
+            clip_name=clip.clip_name,
+            file_name=clip.file_name,
+            file_path=clip.file_path,
+            timeline_name=clip.timeline_name,
+            track_name=clip.track_name,
+            description=description,
+            transcript=clip.transcript,
+            tags=tags,
+            clip_type=clip_type,
+            markers=clip.markers,
+            timeline_markers=clip.timeline_markers,
+            visual_descriptions=visual_descriptions,
+            codec=clip.codec,
+            resolution=clip.resolution,
+        )
+        source_signature = build_source_signature(
+            clip_name=clip.clip_name,
+            file_path=clip.file_path,
+            timeline_name=clip.timeline_name,
+            track_index=clip.track,
+            start_frame=clip.start_frame,
+            end_frame=clip.end_frame,
+            duration_frames=clip.duration_frames,
+            fps=clip.fps,
+            resolution=clip.resolution,
+            codec=clip.codec,
+            markers=clip.markers,
+            timeline_markers=clip.timeline_markers,
+            transcript=clip.transcript,
+            vision_cache_signature=analysis.cache_signature,
+        )
+
+        return ClipRecord(
+            clip_id=clip.clip_id,
+            content_signature=clip.content_signature,
+            vision_cache_signature=analysis.cache_signature,
+            project_uid=clip.project_uid,
+            timeline_uid=clip.timeline_uid,
+            timeline_name=clip.timeline_name,
+            timeline_index=clip.timeline_index,
+            clip_name=clip.clip_name,
+            file_path=clip.file_path,
+            file_name=clip.file_name,
+            track=clip.track,
+            track_name=clip.track_name,
+            item_index=clip.item_index,
+            start_frame=clip.start_frame,
+            end_frame=clip.end_frame,
+            duration_frames=clip.duration_frames,
+            duration_seconds=clip.duration_seconds,
+            fps=clip.fps,
+            start_timecode=clip.start_timecode,
+            end_timecode=clip.end_timecode,
+            source_in=clip.source_in,
+            source_out=clip.source_out,
+            resolution=clip.resolution,
+            codec=clip.codec,
+            clip_color=clip.clip_color,
+            clip_type=clip_type,
+            has_audio=clip.has_audio,
+            description=description,
+            transcript=clip.transcript,
+            detected_objects=analysis.detected_objects or clip.detected_objects,
+            tags=tags,
+            markers=clip.markers,
+            timeline_markers=clip.timeline_markers,
+            visual_descriptions=visual_descriptions,
+            searchable_text=searchable_text,
+            source_signature=source_signature,
+            thumbnail_data=clip.thumbnail_data,
+        )
+
+    def enrich_clip(self, clip: ClipRecord) -> ClipRecord | None:
+        analysis = self.visual_analyzer.enrich(
+            clip_name=clip.clip_name,
+            clip_type=clip.clip_type,
+            tags=clip.tags,
+            file_path=clip.file_path,
+            duration_seconds=clip.duration_seconds,
+            detected_objects=clip.detected_objects,
+        )
+        if not analysis:
+            return None
+        return self._apply_analysis_to_clip(clip=clip, analysis=analysis)
+
     def build_index(
         self,
         *,
@@ -304,7 +441,9 @@ class IndexingService:
         timeline_names: list[str] | None,
         quick_mode: bool,
         progress_callback: ProgressCallback | None = None,
-    ) -> None:
+        session_action_callback: SessionActionCallback | None = None,
+        cancellation_callback: CancellationCallback | None = None,
+    ) -> IndexBuildResult:
         signature = self.resolve.compute_project_signature()
         target_uids = set(timeline_uids or [])
         target_names = set(timeline_names or [])
@@ -338,6 +477,7 @@ class IndexingService:
                 or timeline["timeline_name"] in target_names
             )
         )
+        enrichment_tasks: list[EnrichmentTask] = []
 
         state = ReindexState(
             running=True,
@@ -352,17 +492,16 @@ class IndexingService:
             progress_callback(state)
 
         run_indexed_at = state.started_at or now_iso()
-        self.store.upsert_project_meta(
-            ProjectIndexMeta(
-                project_uid=signature["project_uid"],
-                project_name=signature["project_name"],
-                indexed_at=run_indexed_at,
-                clip_count=signature["clip_count"],
-                timeline_count=signature["timeline_count"],
-                signature_hash=signature["signature_hash"],
-                quick_mode=quick_mode,
-            )
+        project_meta = ProjectIndexMeta(
+            project_uid=signature["project_uid"],
+            project_name=signature["project_name"],
+            indexed_at=run_indexed_at,
+            clip_count=signature["clip_count"],
+            timeline_count=signature["timeline_count"],
+            signature_hash=signature["signature_hash"],
+            quick_mode=quick_mode,
         )
+        self.store.upsert_project_meta(project_meta)
 
         def _index(_resolve: Any, _project_manager: Any, project: Any) -> None:
             seen_clip_ids: set[str] = set()
@@ -371,6 +510,8 @@ class IndexingService:
             timeline_count = safe_call(project.GetTimelineCount, default=0) or 0
             current_indexed = 0
             for timeline_index in range(1, timeline_count + 1):
+                if cancellation_callback and cancellation_callback():
+                    raise IndexingCancelledError("Indexing stopped by user.")
                 timeline = safe_call(project.GetTimelineByIndex, timeline_index)
                 if not timeline:
                     continue
@@ -386,6 +527,8 @@ class IndexingService:
                 state.message = f'Indexing "{timeline_name}"'
                 if progress_callback:
                     progress_callback(state)
+                if session_action_callback:
+                    session_action_callback(_resolve, project)
 
                 timeline_markers = normalize_markers(
                     safe_call(timeline.GetMarkers, default={}) or {}
@@ -416,6 +559,8 @@ class IndexingService:
                 track_count = safe_call(timeline.GetTrackCount, "video", default=0) or 0
                 timeline_clip_count = 0
                 for track_index in range(1, track_count + 1):
+                    if cancellation_callback and cancellation_callback():
+                        raise IndexingCancelledError("Indexing stopped by user.")
                     track_name = safe_call(
                         timeline.GetTrackName,
                         "video",
@@ -433,6 +578,8 @@ class IndexingService:
                         key=lambda item: safe_call(item.GetStart, default=0) or 0,
                     )
                     for item_index, item in enumerate(ordered_items, start=1):
+                        if cancellation_callback and cancellation_callback():
+                            raise IndexingCancelledError("Indexing stopped by user.")
                         clip_label = safe_call(item.GetName) or f"Clip {item_index}"
                         state.current_timeline = timeline_name
                         state.active_clip_index = current_indexed + 1
@@ -443,25 +590,7 @@ class IndexingService:
                         if progress_callback:
                             progress_callback(state)
 
-                        def handle_partial_clip(
-                            partial_clip: ClipRecord,
-                            stage_label: str,
-                        ) -> None:
-                            seen_clip_ids.add(partial_clip.clip_id)
-                            self.store.upsert_clip(
-                                partial_clip,
-                                indexed_at=run_indexed_at,
-                            )
-                            state.message = (
-                                f"{stage_label} {current_indexed + 1}/{total_target_clips}: "
-                                f"{clip_label}"
-                            )
-                            state.latest_clip = clip_record_to_result(partial_clip)
-                            state.latest_clip_stage = stage_label
-                            if progress_callback:
-                                progress_callback(state)
-
-                        clip = self._build_clip_record(
+                        build_result = self._build_clip_record(
                             project=project,
                             signature=signature,
                             timeline=timeline,
@@ -480,10 +609,12 @@ class IndexingService:
                             existing_cache_by_clip_id=existing_cache_by_clip_id,
                             existing_cache_by_content_signature=existing_cache_by_content_signature,
                             quick_mode=quick_mode,
-                            partial_record_callback=handle_partial_clip,
                         )
+                        clip = build_result.clip
                         self.store.upsert_clip(clip, indexed_at=run_indexed_at)
                         seen_clip_ids.add(clip.clip_id)
+                        if build_result.enrichment_task:
+                            enrichment_tasks.append(build_result.enrichment_task)
                         timeline_clip_count += 1
                         current_indexed += 1
                         state.processed_clips = current_indexed
@@ -494,6 +625,11 @@ class IndexingService:
                         state.latest_clip_stage = "Completed clip"
                         if progress_callback:
                             progress_callback(state)
+                        if session_action_callback:
+                            session_action_callback(_resolve, project)
+
+                if cancellation_callback and cancellation_callback():
+                    raise IndexingCancelledError("Indexing stopped by user.")
 
                 self.store.upsert_timeline(
                     TimelineRecord(
@@ -506,6 +642,8 @@ class IndexingService:
                 )
                 seen_timeline_uids.add(timeline_uid)
 
+            if cancellation_callback and cancellation_callback():
+                raise IndexingCancelledError("Indexing stopped by user.")
             self.store.cleanup_index_scope(
                 project_uid=signature["project_uid"],
                 keep_clip_ids=seen_clip_ids,
@@ -527,6 +665,10 @@ class IndexingService:
             )
 
         self.resolve.with_project(_index)
+        return IndexBuildResult(
+            project_meta=project_meta,
+            enrichment_tasks=enrichment_tasks,
+        )
 
     def _build_clip_record(
         self,
@@ -549,8 +691,7 @@ class IndexingService:
         existing_cache_by_clip_id: dict[str, dict[str, Any]],
         existing_cache_by_content_signature: dict[str, list[dict[str, Any]]],
         quick_mode: bool,
-        partial_record_callback: PartialClipCallback | None = None,
-    ) -> ClipRecord:
+    ) -> ClipBuildResult:
         media_pool_item = safe_call(item.GetMediaPoolItem)
         clip_props = safe_call(media_pool_item.GetClipProperty, default={}) if media_pool_item else {}
         clip_props = clip_props or {}
@@ -667,8 +808,14 @@ class IndexingService:
         )
         tags = dedupe(tags + [clip_type])
 
+        background_enrichment = self._supports_background_enrichment(quick_mode=quick_mode)
         desired_vision_signature = (
             "quick:v1" if quick_mode else self.visual_analyzer.cache_signature()
+        )
+        desired_local_vision_signature = (
+            desired_vision_signature
+            if not background_enrichment
+            else self.visual_analyzer.local_cache_signature()
         )
         analysis_duration_seconds = (max(duration_frames, 0) / fps) if fps else 0.0
         desired_source_signature = build_source_signature(
@@ -687,6 +834,22 @@ class IndexingService:
             transcript=str(transcript) if transcript is not None else None,
             vision_cache_signature=desired_vision_signature,
         )
+        desired_local_source_signature = build_source_signature(
+            clip_name=clip_name,
+            file_path=file_path,
+            timeline_name=timeline_name,
+            track_index=track_index,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            duration_frames=duration_frames,
+            fps=fps,
+            resolution=str(resolution) if resolution is not None else None,
+            codec=str(codec) if codec is not None else None,
+            markers=all_markers,
+            timeline_markers=near_markers,
+            transcript=str(transcript) if transcript is not None else None,
+            vision_cache_signature=desired_local_vision_signature,
+        )
 
         has_audio = any(
             lookup_value(clip_props, key)
@@ -703,6 +866,7 @@ class IndexingService:
             source_signature_value: str,
             vision_cache_signature_value: str,
             thumbnail_data_value: str | None,
+            detected_objects_value: list[str],
         ) -> ClipRecord:
             resolved_description = description_value.strip()
             if not resolved_description:
@@ -763,6 +927,7 @@ class IndexingService:
                 has_audio=bool(has_audio),
                 description=resolved_description,
                 transcript=str(transcript_value) if transcript_value is not None else None,
+                detected_objects=detected_objects_value,
                 tags=tags_value,
                 markers=all_markers,
                 timeline_markers=near_markers,
@@ -785,6 +950,7 @@ class IndexingService:
         description: str
         thumbnail_data: str | None = cached.get("thumbnail_data") if cached else None
         effective_vision_signature = desired_vision_signature
+        detected_objects: list[str] = []
         cached_visual_descriptions = [
             VisualDescription(
                 frame_offset_sec=float(item["frame_offset_sec"]),
@@ -794,6 +960,10 @@ class IndexingService:
         ] if cached else []
         cached_description = str(cached.get("description") or "") if cached else ""
         cached_vision_signature = str(cached.get("vision_cache_signature") or "") if cached else ""
+        cached_detected_objects = (
+            [str(item) for item in json.loads(cached.get("detected_objects_json") or "[]")]
+            if cached else []
+        )
         cached_has_stale_heuristic_visual = (
             bool(cached)
             and not quick_mode
@@ -811,6 +981,12 @@ class IndexingService:
             and cached_vision_signature == desired_vision_signature
             and not cached_has_stale_heuristic_visual
         )
+        cached_local_analysis_reusable = (
+            bool(cached)
+            and background_enrichment
+            and cached_vision_signature == desired_local_vision_signature
+            and str(cached.get("source_signature") or "") == desired_local_source_signature
+        )
 
         if (
             cached
@@ -825,10 +1001,52 @@ class IndexingService:
             thumbnail_data = cached.get("thumbnail_data")
             clip_type = str(cached.get("clip_type") or clip_type)
             tags = dedupe(tags + json.loads(cached["tags_json"]))
+            detected_objects = cached_detected_objects
             if cached_vision_signature:
                 effective_vision_signature = cached_vision_signature
             source_signature = str(
                 cached.get("source_signature") or desired_source_signature
+            )
+            return ClipBuildResult(
+                clip=compose_clip_record(
+                    clip_type_value=clip_type,
+                    tags_value=tags,
+                    visual_descriptions_value=visual_descriptions,
+                    description_value=description,
+                    transcript_value=transcript,
+                    source_signature_value=source_signature,
+                    vision_cache_signature_value=effective_vision_signature,
+                    thumbnail_data_value=thumbnail_data,
+                    detected_objects_value=detected_objects,
+                )
+            )
+        if cached_local_analysis_reusable:
+            visual_descriptions = cached_visual_descriptions
+            description = cached_description
+            transcript = transcript or cached.get("transcript")
+            thumbnail_data = cached.get("thumbnail_data")
+            clip_type = str(cached.get("clip_type") or clip_type)
+            tags = dedupe(tags + json.loads(cached["tags_json"]))
+            detected_objects = cached_detected_objects
+            source_signature = desired_local_source_signature
+            local_clip = compose_clip_record(
+                clip_type_value=clip_type,
+                tags_value=tags,
+                visual_descriptions_value=visual_descriptions,
+                description_value=description,
+                transcript_value=transcript,
+                source_signature_value=source_signature,
+                vision_cache_signature_value=desired_local_vision_signature,
+                thumbnail_data_value=thumbnail_data,
+                detected_objects_value=detected_objects,
+            )
+            return ClipBuildResult(
+                clip=local_clip,
+                enrichment_task=(
+                    EnrichmentTask(clip=local_clip)
+                    if file_path
+                    else None
+                ),
             )
         else:
             visual_descriptions = []
@@ -837,52 +1055,27 @@ class IndexingService:
             actual_vision_signature = desired_vision_signature
             source_signature = desired_source_signature
             if not quick_mode:
-                def emit_partial_analysis(analysis: Any) -> None:
-                    if not partial_record_callback:
-                        return
-
-                    partial_clip_type = analysis.clip_type_hint or clip_type
-                    partial_tags = dedupe(tags + analysis.tags + [partial_clip_type])
-                    partial_source_signature = build_source_signature(
+                if background_enrichment:
+                    analysis = self.visual_analyzer.analyze_local(
                         clip_name=clip_name,
+                        clip_type=clip_type,
+                        tags=tags,
                         file_path=file_path,
-                        timeline_name=timeline_name,
-                        track_index=track_index,
-                        start_frame=start_frame,
-                        end_frame=end_frame,
-                        duration_frames=duration_frames,
-                        fps=fps,
-                        resolution=str(resolution) if resolution is not None else None,
-                        codec=str(codec) if codec is not None else None,
-                        markers=all_markers,
-                        timeline_markers=near_markers,
-                        transcript=str(transcript) if transcript is not None else None,
-                        vision_cache_signature=analysis.cache_signature,
+                        duration_seconds=analysis_duration_seconds,
                     )
-                    partial_record_callback(
-                        compose_clip_record(
-                            clip_type_value=partial_clip_type,
-                            tags_value=partial_tags,
-                            visual_descriptions_value=analysis.frame_descriptions,
-                            description_value=analysis.summary,
-                            transcript_value=transcript,
-                            source_signature_value=partial_source_signature,
-                            vision_cache_signature_value=analysis.cache_signature,
-                            thumbnail_data_value=thumbnail_data,
-                        ),
-                        "Saved YOLO objects for",
+                    actual_vision_signature = analysis.cache_signature
+                    source_signature = desired_local_source_signature
+                else:
+                    analysis = self.visual_analyzer.analyze(
+                        clip_name=clip_name,
+                        clip_type=clip_type,
+                        tags=tags,
+                        file_path=file_path,
+                        duration_seconds=analysis_duration_seconds,
                     )
-
-                analysis = self.visual_analyzer.analyze(
-                    clip_name=clip_name,
-                    clip_type=clip_type,
-                    tags=tags,
-                    file_path=file_path,
-                    duration_seconds=analysis_duration_seconds,
-                    partial_callback=emit_partial_analysis,
-                )
                 visual_descriptions = analysis.frame_descriptions
                 actual_vision_signature = analysis.cache_signature
+                detected_objects = analysis.detected_objects
                 if analysis.clip_type_hint:
                     clip_type = analysis.clip_type_hint
                 tags = dedupe(tags + analysis.tags + [clip_type])
@@ -918,17 +1111,25 @@ class IndexingService:
                 vision_cache_signature=actual_vision_signature,
             )
             effective_vision_signature = actual_vision_signature
-
-        return compose_clip_record(
-            clip_type_value=clip_type,
-            tags_value=tags,
-            visual_descriptions_value=visual_descriptions,
-            description_value=description,
-            transcript_value=transcript,
-            source_signature_value=source_signature,
-            vision_cache_signature_value=effective_vision_signature,
-            thumbnail_data_value=thumbnail_data,
-        )
+            built_clip = compose_clip_record(
+                clip_type_value=clip_type,
+                tags_value=tags,
+                visual_descriptions_value=visual_descriptions,
+                description_value=description,
+                transcript_value=transcript,
+                source_signature_value=source_signature,
+                vision_cache_signature_value=effective_vision_signature,
+                thumbnail_data_value=thumbnail_data,
+                detected_objects_value=detected_objects,
+            )
+            return ClipBuildResult(
+                clip=built_clip,
+                enrichment_task=(
+                    EnrichmentTask(clip=built_clip)
+                    if background_enrichment and file_path
+                    else None
+                ),
+            )
 
     @staticmethod
     def _resolution_from_props(clip_props: dict[str, Any]) -> str | None:
@@ -945,7 +1146,10 @@ class ReindexCoordinator:
         self._state = ReindexState()
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
+        self._enrichment_worker: threading.Thread | None = None
         self._listeners: set[queue.Queue[dict[str, Any]]] = set()
+        self._jump_requests: queue.Queue[PendingJumpRequest] = queue.Queue()
+        self._cancel_requested = threading.Event()
 
     def snapshot(self) -> ReindexState:
         with self._lock:
@@ -959,12 +1163,15 @@ class ReindexCoordinator:
         quick_mode: bool,
     ) -> ReindexState:
         with self._lock:
-            if self._state.running:
+            if self._state.running or self._state.enrichment_running:
                 return ReindexState(**self._state.to_dict())
 
+            self._cancel_requested.clear()
             self._state = ReindexState(
                 running=True,
+                enrichment_running=False,
                 progress=0.0,
+                enrichment_progress=0.0,
                 message="Starting reindex",
                 started_at=now_iso(),
                 finished_at=None,
@@ -972,6 +1179,8 @@ class ReindexCoordinator:
                 current_timeline=None,
                 processed_clips=0,
                 total_clips=0,
+                enriched_clips=0,
+                total_enrichment_clips=0,
                 active_clip_index=0,
                 active_clip_name=None,
                 quick_mode=quick_mode,
@@ -989,6 +1198,37 @@ class ReindexCoordinator:
             )
             self._worker.start()
             return ReindexState(**self._state.to_dict())
+
+    def cancel(self) -> ReindexState:
+        with self._lock:
+            if not self._state.running and not self._state.enrichment_running:
+                return ReindexState(**self._state.to_dict())
+
+            self._cancel_requested.set()
+            active_message = (
+                "Stopping after current clip..."
+                if self._state.running
+                else "Stopping Gemini enrichment after current clip..."
+            )
+            self._state.message = active_message
+            self._broadcast_locked()
+            return ReindexState(**self._state.to_dict())
+
+    def _is_cancel_requested(self) -> bool:
+        return self._cancel_requested.is_set()
+
+    def request_jump(self, clip: dict[str, Any], *, timeout_sec: float = 20.0) -> dict[str, Any]:
+        request = PendingJumpRequest(clip=clip)
+        self._jump_requests.put(request)
+        if not request.done.wait(timeout=timeout_sec):
+            raise ResolveConnectionError(
+                "Jump request timed out while indexing. Try again in a moment."
+            )
+        if request.error:
+            raise request.error
+        if not request.result:
+            raise ResolveConnectionError("Jump request did not return a result.")
+        return request.result
 
     def _update(self, state: ReindexState) -> None:
         with self._lock:
@@ -1037,26 +1277,206 @@ class ReindexCoordinator:
         quick_mode: bool,
     ) -> None:
         try:
-            self.indexing_service.build_index(
+            build_result = self.indexing_service.build_index(
                 timeline_uids=timeline_uids,
                 timeline_names=timeline_names,
                 quick_mode=quick_mode,
                 progress_callback=self._update,
+                session_action_callback=self._service_pending_jump_requests,
+                cancellation_callback=self._is_cancel_requested,
             )
             with self._lock:
+                cancelled = self._cancel_requested.is_set()
                 self._state.running = False
-                self._state.progress = 1.0
-                self._state.message = "Index complete"
+                self._state.progress = 1.0 if not cancelled else min(self._state.progress, 0.999)
+                self._state.active_clip_index = 0
+                self._state.active_clip_name = None
+                if cancelled:
+                    self._state.enrichment_running = False
+                    self._state.enrichment_progress = 0.0
+                    self._state.message = "Indexing stopped"
+                    self._state.finished_at = now_iso()
+                    self._broadcast_locked()
+                elif build_result.enrichment_tasks:
+                    self._state.enrichment_running = True
+                    self._state.enrichment_progress = 0.0
+                    self._state.enriched_clips = 0
+                    self._state.total_enrichment_clips = len(build_result.enrichment_tasks)
+                    self._state.message = (
+                        f"Index ready, Gemini enriching 0/{len(build_result.enrichment_tasks)} clips"
+                    )
+                    self._broadcast_locked()
+                    self._enrichment_worker = threading.Thread(
+                        target=self._run_enrichment,
+                        kwargs={
+                            "tasks": build_result.enrichment_tasks,
+                            "project_meta": build_result.project_meta,
+                        },
+                        daemon=True,
+                    )
+                    self._enrichment_worker.start()
+                else:
+                    self._state.message = "Index complete"
+                    self._state.finished_at = now_iso()
+                    self._broadcast_locked()
+            self._fail_pending_jump_requests(
+                ResolveConnectionError("Indexing finished before the jump request was handled.")
+            )
+        except IndexingCancelledError:
+            with self._lock:
+                self._state.running = False
+                self._state.enrichment_running = False
+                self._state.message = "Indexing stopped"
                 self._state.finished_at = now_iso()
                 self._state.active_clip_index = 0
                 self._state.active_clip_name = None
                 self._broadcast_locked()
+            self._fail_pending_jump_requests(
+                ResolveConnectionError("Indexing was stopped before the jump request was handled.")
+            )
         except Exception as exc:
             with self._lock:
                 self._state.running = False
+                self._state.enrichment_running = False
                 self._state.last_error = str(exc)
                 self._state.message = "Indexing failed"
                 self._state.finished_at = now_iso()
                 self._state.active_clip_index = 0
                 self._state.active_clip_name = None
                 self._broadcast_locked()
+            self._fail_pending_jump_requests(
+                exc if isinstance(exc, ResolveConnectionError) else ResolveConnectionError(str(exc))
+            )
+
+    def _run_enrichment(
+        self,
+        *,
+        tasks: list[EnrichmentTask],
+        project_meta: ProjectIndexMeta,
+    ) -> None:
+        try:
+            for index, task in enumerate(tasks, start=1):
+                if self._is_cancel_requested():
+                    with self._lock:
+                        self._state.enrichment_running = False
+                        self._state.message = "Gemini enrichment stopped"
+                        self._state.finished_at = now_iso()
+                        self._state.active_clip_index = 0
+                        self._state.active_clip_name = None
+                        self._broadcast_locked()
+                    return
+                with self._lock:
+                    self._state.active_clip_index = index
+                    self._state.active_clip_name = task.clip.file_name or task.clip.clip_name
+                    self._state.message = (
+                        f"Gemini enriching {index}/{len(tasks)}: "
+                        f"{task.clip.file_name or task.clip.clip_name}"
+                    )
+                    self._broadcast_locked()
+
+                try:
+                    enriched_clip = self.indexing_service.enrich_clip(task.clip)
+                except Exception as exc:
+                    enriched_clip = None
+                    with self._lock:
+                        self._state.last_error = str(exc)
+
+                if enriched_clip:
+                    self.indexing_service.store.upsert_clip(
+                        enriched_clip,
+                        indexed_at=now_iso(),
+                    )
+                    with self._lock:
+                        self._state.latest_clip = clip_record_to_result(enriched_clip)
+                        self._state.latest_clip_stage = "Gemini enrichment complete"
+
+                with self._lock:
+                    self._state.enriched_clips = index
+                    self._state.total_enrichment_clips = len(tasks)
+                    if tasks:
+                        self._state.enrichment_progress = min(index / len(tasks), 1.0)
+                    self._state.message = f"Gemini enriched {index}/{len(tasks)} clips"
+                    self._broadcast_locked()
+
+            if self._is_cancel_requested():
+                with self._lock:
+                    self._state.enrichment_running = False
+                    self._state.message = "Gemini enrichment stopped"
+                    self._state.finished_at = now_iso()
+                    self._state.active_clip_index = 0
+                    self._state.active_clip_name = None
+                    self._broadcast_locked()
+                return
+
+            self.indexing_service.store.finalize_project_meta(
+                ProjectIndexMeta(
+                    project_uid=project_meta.project_uid,
+                    project_name=project_meta.project_name,
+                    indexed_at=now_iso(),
+                    clip_count=project_meta.clip_count,
+                    timeline_count=project_meta.timeline_count,
+                    signature_hash=project_meta.signature_hash,
+                    quick_mode=project_meta.quick_mode,
+                )
+            )
+            with self._lock:
+                self._state.enrichment_running = False
+                self._state.enrichment_progress = 1.0 if tasks else 0.0
+                self._state.message = "Index and Gemini enrichment complete"
+                self._state.finished_at = now_iso()
+                self._state.active_clip_index = 0
+                self._state.active_clip_name = None
+                self._broadcast_locked()
+        except Exception as exc:
+            with self._lock:
+                self._state.enrichment_running = False
+                self._state.last_error = str(exc)
+                self._state.message = "Gemini enrichment failed"
+                self._state.finished_at = now_iso()
+                self._state.active_clip_index = 0
+                self._state.active_clip_name = None
+                self._broadcast_locked()
+
+    def _service_pending_jump_requests(self, resolve: Any, project: Any) -> None:
+        while True:
+            try:
+                request = self._jump_requests.get_nowait()
+            except queue.Empty:
+                return
+
+            try:
+                request.result = self.indexing_service.resolve.jump_to_clip_in_project(
+                    resolve=resolve,
+                    project=project,
+                    clip_id=request.clip["clip_id"],
+                    timeline_uid=request.clip["timeline_uid"],
+                    timeline_name=request.clip["timeline_name"],
+                    start_timecode=request.clip["start_timecode"],
+                    clip_name=request.clip.get("clip_name"),
+                    file_path=request.clip.get("file_path"),
+                    duration_frames=request.clip.get("duration_frames"),
+                    track_index=request.clip.get("track"),
+                )
+            except Exception as exc:
+                request.error = (
+                    exc if isinstance(exc, ResolveConnectionError) else ResolveConnectionError(str(exc))
+                )
+            finally:
+                request.done.set()
+
+    def _fail_pending_jump_requests(self, error: ResolveConnectionError) -> None:
+        while True:
+            try:
+                request = self._jump_requests.get_nowait()
+            except queue.Empty:
+                return
+            request.error = error
+            request.done.set()
+
+
+@dataclass(slots=True)
+class PendingJumpRequest:
+    clip: dict[str, Any]
+    done: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, Any] | None = None
+    error: ResolveConnectionError | None = None

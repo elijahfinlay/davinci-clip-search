@@ -41,6 +41,7 @@ class VisionAnalysis:
     summary: str
     tags: list[str] = field(default_factory=list)
     frame_descriptions: list[VisualDescription] = field(default_factory=list)
+    detected_objects: list[str] = field(default_factory=list)
     clip_type_hint: str | None = None
     cache_signature: str = "heuristic:v1"
     provider: str = "heuristic"
@@ -78,6 +79,7 @@ class ClipRecord:
     has_audio: bool
     description: str
     transcript: str | None
+    detected_objects: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     markers: list[MarkerInfo] = field(default_factory=list)
     timeline_markers: list[MarkerInfo] = field(default_factory=list)
@@ -110,7 +112,9 @@ class ProjectIndexMeta:
 @dataclass(slots=True)
 class ReindexState:
     running: bool = False
+    enrichment_running: bool = False
     progress: float = 0.0
+    enrichment_progress: float = 0.0
     message: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
@@ -118,6 +122,8 @@ class ReindexState:
     current_timeline: str | None = None
     processed_clips: int = 0
     total_clips: int = 0
+    enriched_clips: int = 0
+    total_enrichment_clips: int = 0
     active_clip_index: int = 0
     active_clip_name: str | None = None
     quick_mode: bool = False
@@ -127,7 +133,9 @@ class ReindexState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "running": self.running,
+            "enrichment_running": self.enrichment_running,
             "progress": self.progress,
+            "enrichment_progress": self.enrichment_progress,
             "message": self.message,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -135,6 +143,8 @@ class ReindexState:
             "current_timeline": self.current_timeline,
             "processed_clips": self.processed_clips,
             "total_clips": self.total_clips,
+            "enriched_clips": self.enriched_clips,
+            "total_enrichment_clips": self.total_enrichment_clips,
             "active_clip_index": self.active_clip_index,
             "active_clip_name": self.active_clip_name,
             "quick_mode": self.quick_mode,

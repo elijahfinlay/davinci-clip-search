@@ -186,6 +186,19 @@ def _dedupe_float_offsets(offsets: list[float]) -> list[float]:
     return ordered or [0.0]
 
 
+def _closest_frame(
+    frames: list["ExtractedFrame"],
+    *,
+    target_offset_sec: float,
+) -> "ExtractedFrame" | None:
+    if not frames:
+        return None
+    return min(
+        frames,
+        key=lambda frame: abs(frame.frame_offset_sec - target_offset_sec),
+    )
+
+
 @dataclass(slots=True)
 class ExtractedFrame:
     frame_offset_sec: float
@@ -344,6 +357,7 @@ def _analysis_from_legacy_response(
         summary=summary,
         tags=tags,
         frame_descriptions=frame_descriptions,
+        detected_objects=[],
         clip_type_hint=_canonical_clip_type(payload.get("clip_type_hint"))
         or _canonical_clip_type(clip_type),
         cache_signature=cache_signature,
@@ -459,6 +473,7 @@ def _guided_analysis_from_response(
                 description=summary,
             )
         ],
+        detected_objects=detected_objects,
         clip_type_hint=_canonical_clip_type(payload.get("clip_type_hint"))
         or _canonical_clip_type(clip_type),
         cache_signature=cache_signature,
@@ -514,6 +529,7 @@ def _object_aware_fallback_analysis(
         frame_descriptions=[
             VisualDescription(frame_offset_sec=frame_offset_sec, description=summary)
         ],
+        detected_objects=detected_objects,
         clip_type_hint=fallback_result.clip_type_hint,
         cache_signature=fallback_result.cache_signature,
         provider=fallback_result.provider,
@@ -547,6 +563,7 @@ def _detected_objects_analysis(
                 description=summary,
             )
         ],
+        detected_objects=detected_objects,
         clip_type_hint=_canonical_clip_type(clip_type),
         cache_signature=cache_signature,
         provider="yolo-world",
@@ -557,6 +574,12 @@ def _detected_objects_analysis(
 class BaseVisualAnalyzer:
     def cache_signature(self) -> str:
         raise NotImplementedError
+
+    def local_cache_signature(self) -> str:
+        return self.cache_signature()
+
+    def background_enrichment_enabled(self) -> bool:
+        return False
 
     def analyze(
         self,
@@ -569,6 +592,35 @@ class BaseVisualAnalyzer:
         partial_callback: Callable[[VisionAnalysis], None] | None = None,
     ) -> VisionAnalysis:
         raise NotImplementedError
+
+    def analyze_local(
+        self,
+        *,
+        clip_name: str,
+        clip_type: str,
+        tags: list[str],
+        file_path: str,
+        duration_seconds: float,
+    ) -> VisionAnalysis:
+        return self.analyze(
+            clip_name=clip_name,
+            clip_type=clip_type,
+            tags=tags,
+            file_path=file_path,
+            duration_seconds=duration_seconds,
+        )
+
+    def enrich(
+        self,
+        *,
+        clip_name: str,
+        clip_type: str,
+        tags: list[str],
+        file_path: str,
+        duration_seconds: float,
+        detected_objects: list[str],
+    ) -> VisionAnalysis | None:
+        return None
 
 
 class HeuristicVisualAnalyzer(BaseVisualAnalyzer):
@@ -595,6 +647,7 @@ class HeuristicVisualAnalyzer(BaseVisualAnalyzer):
             frame_descriptions=[
                 VisualDescription(frame_offset_sec=0.0, description=summary)
             ],
+            detected_objects=[],
             clip_type_hint=_canonical_clip_type(clip_type),
             cache_signature=self.cache_signature(),
             provider="heuristic",
@@ -623,6 +676,13 @@ class YoloWorldObjectDetector:
         )
 
     def detect(self, *, file_path: str, duration_seconds: float) -> list[str]:
+        frames = self.sample_frames(
+            file_path=file_path,
+            duration_seconds=duration_seconds,
+        )
+        return self.detect_from_frames(frames=frames)
+
+    def sample_frames(self, *, file_path: str, duration_seconds: float) -> list[ExtractedFrame]:
         if not self.available() or not file_path:
             return []
 
@@ -630,24 +690,48 @@ class YoloWorldObjectDetector:
         if not file.exists():
             return []
 
-        frames = _extract_frames(
+        return _extract_frames(
             ffmpeg_binary=self._ffmpeg,
             settings=self.settings,
             file_path=file,
             offsets=_yolo_world_offsets(duration_seconds),
         )
-        if not frames:
+
+    def detect_from_frames(self, *, frames: list[ExtractedFrame]) -> list[str]:
+        if not self.available() or not frames:
             return []
 
         model = self._get_model()
         if not model:
             return []
 
+        frame_images: list[Any] = []
+        for frame in frames:
+            try:
+                image = Image.open(io.BytesIO(frame.image_bytes)).convert("RGB")
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                LOGGER.warning("YOLO World frame decode failed: %s", exc)
+                continue
+            frame_images.append(np.array(image))
+
+        if not frame_images:
+            return []
+
+        try:
+            results = model.predict(
+                source=frame_images,
+                conf=self.settings.yolo_world_confidence,
+                verbose=False,
+            )
+        except Exception as exc:  # pragma: no cover - runtime dependency
+            LOGGER.warning("YOLO World batch inference failed: %s", exc)
+            return []
+
         score_by_label: dict[str, float] = {}
         count_by_label: dict[str, int] = {}
 
-        for frame in frames:
-            labels = self._detect_frame_labels(model=model, frame=frame)
+        for result in results or []:
+            labels = self._labels_from_prediction_result(result)
             for label, confidence in labels:
                 count_by_label[label] = count_by_label.get(label, 0) + 1
                 score_by_label[label] = max(score_by_label.get(label, 0.0), confidence)
@@ -675,37 +759,21 @@ class YoloWorldObjectDetector:
                     self._model = False
             return None if self._model is False else self._model
 
-    def _detect_frame_labels(self, *, model: Any, frame: ExtractedFrame) -> list[tuple[str, float]]:
-        if np is None or Image is None:
-            return []
-
-        try:
-            image = Image.open(io.BytesIO(frame.image_bytes)).convert("RGB")
-            image_array = np.array(image)
-            results = model.predict(
-                source=image_array,
-                conf=self.settings.yolo_world_confidence,
-                verbose=False,
-            )
-        except Exception as exc:  # pragma: no cover - runtime dependency
-            LOGGER.warning("YOLO World frame inference failed: %s", exc)
-            return []
-
+    def _labels_from_prediction_result(self, result: Any) -> list[tuple[str, float]]:
         labels: list[tuple[str, float]] = []
-        for result in results or []:
-            names = getattr(result, "names", {}) or {}
-            boxes = getattr(result, "boxes", None)
-            classes = getattr(boxes, "cls", None)
-            confidences = getattr(boxes, "conf", None)
-            if classes is None:
+        names = getattr(result, "names", {}) or {}
+        boxes = getattr(result, "boxes", None)
+        classes = getattr(boxes, "cls", None)
+        confidences = getattr(boxes, "conf", None)
+        if classes is None:
+            return labels
+        class_ids = classes.tolist()
+        confidence_values = confidences.tolist() if confidences is not None else [0.0] * len(class_ids)
+        for index, class_id in enumerate(class_ids):
+            label = _normalize_detection_label(str(names.get(int(class_id), class_id)))
+            if not label:
                 continue
-            class_ids = classes.tolist()
-            confidence_values = confidences.tolist() if confidences is not None else [0.0] * len(class_ids)
-            for index, class_id in enumerate(class_ids):
-                label = _normalize_detection_label(str(names.get(int(class_id), class_id)))
-                if not label:
-                    continue
-                labels.append((label, float(confidence_values[index])))
+            labels.append((label, float(confidence_values[index])))
         return labels
 
 
@@ -869,7 +937,13 @@ class GeminiVisionAnalyzer(BaseVisualAnalyzer):
             f"{self.settings.vision_max_image_edge_px}:v1"
         )
 
-    def analyze(
+    def local_cache_signature(self) -> str:
+        return f"{self.cache_signature()}:{YOLO_PARTIAL_STAGE_SIGNATURE}"
+
+    def background_enrichment_enabled(self) -> bool:
+        return bool(self._client and self._ffmpeg and self._detector.available())
+
+    def analyze_local(
         self,
         *,
         clip_name: str,
@@ -877,9 +951,8 @@ class GeminiVisionAnalyzer(BaseVisualAnalyzer):
         tags: list[str],
         file_path: str,
         duration_seconds: float,
-        partial_callback: Callable[[VisionAnalysis], None] | None = None,
     ) -> VisionAnalysis:
-        if not self._client or not self._ffmpeg or not file_path:
+        if not self.background_enrichment_enabled() or not file_path:
             return _fallback_analysis(
                 self._fallback,
                 clip_name=clip_name,
@@ -900,46 +973,79 @@ class GeminiVisionAnalyzer(BaseVisualAnalyzer):
                 duration_seconds=duration_seconds,
             )
 
-        detected_objects = self._detector.detect(
+        sampled_frames = self._detector.sample_frames(
             file_path=file_path,
             duration_seconds=duration_seconds,
         )
+        detected_objects = self._detector.detect_from_frames(frames=sampled_frames)
         middle_offset = _single_middle_offset(duration_seconds)
-        middle_frame = _extract_frames(
+        frame = _closest_frame(sampled_frames, target_offset_sec=middle_offset)
+
+        if detected_objects:
+            return _detected_objects_analysis(
+                clip_type=clip_type,
+                fallback_tags=tags,
+                detected_objects=detected_objects,
+                frame_offset_sec=frame.frame_offset_sec if frame else middle_offset,
+                cache_signature=self.local_cache_signature(),
+                model=self.settings.yolo_world_model,
+            )
+
+        fallback_result = _fallback_analysis(
+            self._fallback,
+            clip_name=clip_name,
+            clip_type=clip_type,
+            tags=tags,
+            file_path=file_path,
+            duration_seconds=duration_seconds,
+        )
+        return VisionAnalysis(
+            summary=fallback_result.summary,
+            tags=fallback_result.tags,
+            frame_descriptions=[
+                VisualDescription(
+                    frame_offset_sec=frame.frame_offset_sec if frame else middle_offset,
+                    description=fallback_result.summary,
+                )
+            ],
+            detected_objects=[],
+            clip_type_hint=fallback_result.clip_type_hint,
+            cache_signature=self.local_cache_signature(),
+            provider="yolo-world",
+            model=self.settings.yolo_world_model,
+        )
+
+    def enrich(
+        self,
+        *,
+        clip_name: str,
+        clip_type: str,
+        tags: list[str],
+        file_path: str,
+        duration_seconds: float,
+        detected_objects: list[str],
+    ) -> VisionAnalysis | None:
+        if not self.background_enrichment_enabled() or not file_path:
+            return None
+
+        file = Path(file_path)
+        if not file.exists():
+            return None
+
+        middle_offset = _single_middle_offset(duration_seconds)
+        middle_frames = _extract_frames(
             ffmpeg_binary=self._ffmpeg,
             settings=self.settings,
             file_path=file,
             offsets=[middle_offset],
         )
-        if partial_callback:
-            partial_callback(
-                _detected_objects_analysis(
-                    clip_type=clip_type,
-                    fallback_tags=tags,
-                    detected_objects=detected_objects,
-                    frame_offset_sec=middle_offset,
-                    cache_signature=(
-                        f"{self.cache_signature()}:{YOLO_PARTIAL_STAGE_SIGNATURE}"
-                    ),
-                    model=self.settings.yolo_world_model,
-                )
-            )
-        if not middle_frame:
-            return _object_aware_fallback_analysis(
-                self._fallback,
-                clip_name=clip_name,
-                clip_type=clip_type,
-                tags=tags,
-                file_path=file_path,
-                duration_seconds=duration_seconds,
-                detected_objects=detected_objects,
-                frame_offset_sec=middle_offset,
-            )
+        frame = middle_frames[0] if middle_frames else None
+        if frame is None:
+            return None
 
-        frame = middle_frame[0]
         cache_signature = self.cache_signature()
         last_exc: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(self.settings.gemini_max_attempts):
             try:
                 prompt = _build_gemini_guided_prompt(detected_objects)
                 if attempt:
@@ -984,17 +1090,37 @@ class GeminiVisionAnalyzer(BaseVisualAnalyzer):
             except Exception as exc:  # pragma: no cover - depends on external API/runtime
                 last_exc = exc
 
-        LOGGER.warning("Gemini vision fallback for %s: %s", clip_name, last_exc)
-        return _object_aware_fallback_analysis(
-            self._fallback,
+        LOGGER.warning("Gemini enrichment fallback for %s: %s", clip_name, last_exc)
+        return None
+
+    def analyze(
+        self,
+        *,
+        clip_name: str,
+        clip_type: str,
+        tags: list[str],
+        file_path: str,
+        duration_seconds: float,
+        partial_callback: Callable[[VisionAnalysis], None] | None = None,
+    ) -> VisionAnalysis:
+        local_analysis = self.analyze_local(
             clip_name=clip_name,
             clip_type=clip_type,
             tags=tags,
             file_path=file_path,
             duration_seconds=duration_seconds,
-            detected_objects=detected_objects,
-            frame_offset_sec=frame.frame_offset_sec,
         )
+        if partial_callback:
+            partial_callback(local_analysis)
+        enrichment = self.enrich(
+            clip_name=clip_name,
+            clip_type=clip_type,
+            tags=tags,
+            file_path=file_path,
+            duration_seconds=duration_seconds,
+            detected_objects=local_analysis.detected_objects,
+        )
+        return enrichment or local_analysis
 
 
 def build_visual_analyzer(settings: Settings) -> BaseVisualAnalyzer:
