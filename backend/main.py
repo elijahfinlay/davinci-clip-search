@@ -227,29 +227,36 @@ def search(
     q: str = Query("", alias="q"),
     clip_type: str = Query("All"),
     scope: str = Query("all"),
+    timeline_uid: str | None = Query(None),
+    timeline_name: str | None = Query(None),
     limit: int | None = Query(None, ge=1),
 ) -> SearchResponseModel:
     search_scope = scope.lower()
-    if search_scope not in {"all", "current"}:
-        raise HTTPException(status_code=400, detail='Search scope must be "all" or "current".')
+    if search_scope not in {"all", "current", "saved"}:
+        raise HTTPException(status_code=400, detail='Search scope must be "all", "current", or "saved".')
 
-    timeline_uid = None
-    timeline_name = None
+    resolved_timeline_uid = None
+    resolved_timeline_name = None
     if search_scope == "current":
         resolve_status = resolve.get_status()
         if not resolve_status.connected:
             raise HTTPException(status_code=503, detail=resolve_status.message)
         if not resolve_status.current_timeline_name:
             raise HTTPException(status_code=400, detail="Resolve does not currently have an active timeline.")
-        timeline_uid = resolve_status.current_timeline_uid
-        timeline_name = resolve_status.current_timeline_name
+        resolved_timeline_uid = resolve_status.current_timeline_uid
+        resolved_timeline_name = resolve_status.current_timeline_name
+    elif search_scope == "saved":
+        if not timeline_uid and not timeline_name:
+            raise HTTPException(status_code=400, detail="Saved timeline search requires a timeline selection.")
+        resolved_timeline_uid = timeline_uid
+        resolved_timeline_name = timeline_name
 
     payload = search_service.search(
         q,
         clip_type=clip_type,
         scope=search_scope,
-        timeline_uid=timeline_uid,
-        timeline_name=timeline_name,
+        timeline_uid=resolved_timeline_uid,
+        timeline_name=resolved_timeline_name,
         limit=limit,
     )
     return SearchResponseModel(**payload)

@@ -40,7 +40,7 @@ class VisionPipelineTests(unittest.TestCase):
             lighting="bright daylight",
             additional_subjects_or_objects=["campus building"],
         )
-        self.assertTrue(summary.startswith("objects: person, school bus"))
+        self.assertTrue(summary.startswith("person, school bus, campus building"))
         self.assertIn("wide shot", summary)
         self.assertIn("person, school bus", summary)
         self.assertIn("campus building", summary)
@@ -57,12 +57,53 @@ class VisionPipelineTests(unittest.TestCase):
             model="gemini-2.5-flash",
             cache_signature="test-signature",
         )
-        self.assertTrue(analysis.summary.startswith("objects: person, microphone"))
+        self.assertTrue(analysis.summary.startswith("person, microphone, podium"))
         self.assertIn("person", analysis.summary)
         self.assertIn("microphone", analysis.tags)
         self.assertIn("podium", analysis.tags)
         self.assertEqual(analysis.clip_type_hint, "interview")
         self.assertEqual(analysis.frame_descriptions[0].frame_offset_sec, 3.5)
+
+    def test_guided_analysis_accepts_labelled_non_json_response(self) -> None:
+        analysis = _guided_analysis_from_response(
+            """
+            shot type: wide shot
+            camera movement: slow pan
+            lighting: bright daylight
+            additional subjects or objects:
+            - campus building
+            - trees
+            clip type hint: ground
+            """,
+            clip_type="handheld",
+            fallback=None,  # type: ignore[arg-type]
+            fallback_tags=["school"],
+            detected_objects=["person", "bench"],
+            frame=ExtractedFrame(frame_offset_sec=4.0, image_bytes=b""),
+            provider="gemini",
+            model="gemini-2.5-flash",
+            cache_signature="test-signature",
+        )
+        self.assertTrue(analysis.summary.startswith("person, bench, campus building"))
+        self.assertIn("wide shot", analysis.summary)
+        self.assertIn("trees", analysis.tags)
+        self.assertEqual(analysis.clip_type_hint, "handheld")
+
+    def test_guided_analysis_accepts_partial_payload(self) -> None:
+        analysis = _guided_analysis_from_response(
+            '{"shot_type":"wide shot","camera_',
+            clip_type="handheld",
+            fallback=None,  # type: ignore[arg-type]
+            fallback_tags=["school"],
+            detected_objects=["person"],
+            frame=ExtractedFrame(frame_offset_sec=1.5, image_bytes=b""),
+            provider="gemini",
+            model="gemini-2.5-flash",
+            cache_signature="test-signature",
+        )
+        self.assertIn("wide shot", analysis.summary)
+        self.assertIn("person", analysis.tags)
+        self.assertEqual(analysis.clip_type_hint, "handheld")
 
 
 if __name__ == "__main__":

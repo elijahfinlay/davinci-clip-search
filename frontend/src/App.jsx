@@ -4,6 +4,7 @@ const FALLBACK_FILTERS = ["All", "Drone", "Ground", "Interview"];
 const SEARCH_SCOPE_OPTIONS = [
   { value: "all", label: "All timelines" },
   { value: "current", label: "Current timeline" },
+  { value: "saved", label: "Saved timeline" },
 ];
 const INITIAL_RESULT_BATCH = 120;
 const RESULT_BATCH_SIZE = 160;
@@ -511,6 +512,9 @@ export default function ResolveClipSearch() {
   const [selectedId, setSelectedId] = useState(null);
   const [activeFilter, setActiveFilter] = useState("All");
   const [searchScope, setSearchScope] = useState("all");
+  const [selectedSearchTimelineUid, setSelectedSearchTimelineUid] = useState(null);
+  const [searchTimelineScopeOpen, setSearchTimelineScopeOpen] = useState(false);
+  const [searchTimelineQuery, setSearchTimelineQuery] = useState("");
   const [selectedTimelineUids, setSelectedTimelineUids] = useState([]);
   const [indexScopeOpen, setIndexScopeOpen] = useState(false);
   const [timelineSearchQuery, setTimelineSearchQuery] = useState("");
@@ -552,9 +556,12 @@ export default function ResolveClipSearch() {
   const [toast, setToast] = useState(null);
   const inputRef = useRef(null);
   const searchAbortRef = useRef(null);
+  const searchTimelineScopeRef = useRef(null);
+  const searchTimelineInputRef = useRef(null);
   const indexScopeRef = useRef(null);
   const timelineSearchInputRef = useRef(null);
   const loadMoreRef = useRef(null);
+  const hasInitializedSearchTimelineRef = useRef(false);
   const hasInitializedTimelineSelectionRef = useRef(false);
 
   const filterOptions = normalizeFilterOptions(status.index.available_types);
@@ -568,6 +575,15 @@ export default function ResolveClipSearch() {
   const selectedTimelineOptions = selectedTimelineUids
     .map((timelineUid) => timelineOptionsByKey.get(timelineUid))
     .filter(Boolean);
+  const savedSearchTimelineOption = selectedSearchTimelineUid
+    ? (timelineOptionsByKey.get(selectedSearchTimelineUid) || null)
+    : null;
+  const normalizedSearchTimelineQuery = searchTimelineQuery.trim().toLowerCase();
+  const filteredSearchTimelineOptions = normalizedSearchTimelineQuery
+    ? timelineOptions.filter((option) =>
+        option.timeline_name.toLowerCase().includes(normalizedSearchTimelineQuery),
+      )
+    : timelineOptions;
   const normalizedTimelineSearchQuery = timelineSearchQuery.trim().toLowerCase();
   const filteredTimelineOptions = normalizedTimelineSearchQuery
     ? timelineOptions.filter((option) =>
@@ -585,13 +601,23 @@ export default function ResolveClipSearch() {
   const isBusy = status.reindex.running || status.reindex.enrichment_running;
   const isEnriching = status.reindex.enrichment_running && !status.reindex.running;
   const isStopping = isBusy && `${status.reindex.message || ""}`.toLowerCase().startsWith("stopping");
+  const savedSearchTimelineLabel = savedSearchTimelineOption
+    ? savedSearchTimelineOption.timeline_name
+    : "Select timeline";
+  const savedSearchTimelineCountLabel = savedSearchTimelineOption
+    ? `${(savedSearchTimelineOption.total || 0).toLocaleString()} clips`
+    : "No timeline";
   const shouldStreamIntoMainResults = !query.trim() && activeFilter === "All" && searchScope === "all";
   const displayedResults = shouldStreamIntoMainResults && isBusy
     ? mergeResultsWithLiveItems(results, liveClips)
     : results;
   const visibleResults = displayedResults.slice(0, renderCount);
   const canLiveRefreshSearch = Boolean(
-    query.trim() || searchScope === "current" || activeFilter !== "All" || (results.length > 0 && results.length <= 250),
+    query.trim()
+    || searchScope === "current"
+    || searchScope === "saved"
+    || activeFilter !== "All"
+    || (results.length > 0 && results.length <= 250),
   );
 
   useEffect(() => {
@@ -617,6 +643,11 @@ export default function ResolveClipSearch() {
     setSelectedTimelineUids((current) =>
       current.filter((timelineUid) => availableTimelineUids.has(timelineUid)),
     );
+    setSelectedSearchTimelineUid((current) => (
+      current && availableTimelineUids.has(current)
+        ? current
+        : null
+    ));
   }, [timelineOptions]);
 
   useEffect(() => {
@@ -643,6 +674,52 @@ export default function ResolveClipSearch() {
   }, [status.current_timeline_uid, timelineOptions]);
 
   useEffect(() => {
+    if (hasInitializedSearchTimelineRef.current) {
+      return;
+    }
+    if (!timelineOptions.length) {
+      return;
+    }
+
+    const currentTimelineOption = timelineOptions.find(
+      (option) =>
+        (option.timeline_uid || option.timeline_name) === status.current_timeline_uid
+        || option.current,
+    );
+    const defaultOption = currentTimelineOption || timelineOptions[0];
+    if (!defaultOption) {
+      return;
+    }
+
+    hasInitializedSearchTimelineRef.current = true;
+    setSelectedSearchTimelineUid(defaultOption.timeline_uid || defaultOption.timeline_name);
+  }, [status.current_timeline_uid, timelineOptions]);
+
+  useEffect(() => {
+    if (selectedSearchTimelineUid || !timelineOptions.length) {
+      return;
+    }
+
+    const currentTimelineOption = timelineOptions.find(
+      (option) =>
+        (option.timeline_uid || option.timeline_name) === status.current_timeline_uid
+        || option.current,
+    );
+    const defaultOption = currentTimelineOption || timelineOptions[0];
+    if (!defaultOption) {
+      return;
+    }
+
+    setSelectedSearchTimelineUid(defaultOption.timeline_uid || defaultOption.timeline_name);
+  }, [selectedSearchTimelineUid, status.current_timeline_uid, timelineOptions]);
+
+  useEffect(() => {
+    if (searchScope !== "saved") {
+      setSearchTimelineScopeOpen(false);
+    }
+  }, [searchScope]);
+
+  useEffect(() => {
     if (!indexScopeOpen) return undefined;
 
     function handlePointerDown(event) {
@@ -654,6 +731,19 @@ export default function ResolveClipSearch() {
     window.addEventListener("pointerdown", handlePointerDown);
     return () => window.removeEventListener("pointerdown", handlePointerDown);
   }, [indexScopeOpen]);
+
+  useEffect(() => {
+    if (!searchTimelineScopeOpen) return undefined;
+
+    function handlePointerDown(event) {
+      if (!searchTimelineScopeRef.current?.contains(event.target)) {
+        setSearchTimelineScopeOpen(false);
+      }
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [searchTimelineScopeOpen]);
 
   useEffect(() => {
     if (!indexScopeOpen) {
@@ -668,6 +758,20 @@ export default function ResolveClipSearch() {
 
     return () => window.clearTimeout(timeoutId);
   }, [indexScopeOpen]);
+
+  useEffect(() => {
+    if (!searchTimelineScopeOpen) {
+      setSearchTimelineQuery("");
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      searchTimelineInputRef.current?.focus();
+      searchTimelineInputRef.current?.select();
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [searchTimelineScopeOpen]);
 
   useEffect(() => {
     let intervalId;
@@ -780,6 +884,12 @@ export default function ResolveClipSearch() {
         controller.abort();
       };
     }
+    if (searchScope === "saved" && !savedSearchTimelineOption) {
+      setResults([]);
+      return () => {
+        controller.abort();
+      };
+    }
 
     const timerId = window.setTimeout(async () => {
       try {
@@ -787,6 +897,12 @@ export default function ResolveClipSearch() {
         params.set("q", query);
         params.set("clip_type", activeFilter);
         params.set("scope", searchScope);
+        if (searchScope === "saved" && savedSearchTimelineOption) {
+          if (savedSearchTimelineOption.timeline_uid) {
+            params.set("timeline_uid", savedSearchTimelineOption.timeline_uid);
+          }
+          params.set("timeline_name", savedSearchTimelineOption.timeline_name);
+        }
         const nextResults = await request(`/api/search?${params.toString()}`, {
           signal: controller.signal,
         });
@@ -810,7 +926,7 @@ export default function ResolveClipSearch() {
       controller.abort();
       window.clearTimeout(timerId);
     };
-  }, [query, activeFilter, searchScope, status.current_timeline_uid, liveSearchTick]);
+  }, [query, activeFilter, searchScope, savedSearchTimelineOption, status.current_timeline_uid, liveSearchTick]);
 
   useEffect(() => {
     if (!displayedResults.length) {
@@ -954,6 +1070,11 @@ export default function ResolveClipSearch() {
           setIndexScopeOpen(false);
           return;
         }
+        if (searchTimelineScopeOpen) {
+          event.preventDefault();
+          setSearchTimelineScopeOpen(false);
+          return;
+        }
         if (query) {
           event.preventDefault();
           setQuery("");
@@ -961,7 +1082,10 @@ export default function ResolveClipSearch() {
         return;
       }
 
-      if (indexScopeRef.current?.contains(document.activeElement)) {
+      if (
+        indexScopeRef.current?.contains(document.activeElement)
+        || searchTimelineScopeRef.current?.contains(document.activeElement)
+      ) {
         return;
       }
 
@@ -993,7 +1117,7 @@ export default function ResolveClipSearch() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [displayedResults, selectedId, query, indexScopeOpen]);
+  }, [displayedResults, selectedId, query, indexScopeOpen, searchTimelineScopeOpen]);
 
   function handleTimelineToggle(timelineUid) {
     setSelectedTimelineUids((current) => {
@@ -1006,6 +1130,11 @@ export default function ResolveClipSearch() {
           - (timelineOrder.get(right) ?? Number.MAX_SAFE_INTEGER),
       );
     });
+  }
+
+  function handleSavedSearchTimelineSelect(timelineUid) {
+    setSelectedSearchTimelineUid(timelineUid);
+    setSearchTimelineScopeOpen(false);
   }
 
   const statusCopy = status.reindex.running
@@ -1692,6 +1821,11 @@ export default function ResolveClipSearch() {
                   onClick={() => {
                     if (!disabled) {
                       setSearchScope(option.value);
+                      if (option.value === "saved") {
+                        setSearchTimelineScopeOpen(true);
+                      } else {
+                        setSearchTimelineScopeOpen(false);
+                      }
                     }
                   }}
                   title={
@@ -1723,6 +1857,197 @@ export default function ResolveClipSearch() {
                 </button>
               );
             })}
+            {searchScope === "saved" && (
+              <div ref={searchTimelineScopeRef} style={{ position: "relative", marginLeft: 4 }}>
+                <button
+                  onClick={() => setSearchTimelineScopeOpen((open) => !open)}
+                  title={savedSearchTimelineOption?.timeline_name || undefined}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "5px 10px",
+                    borderRadius: 5,
+                    border: "none",
+                    background: "rgba(255,255,255,0.08)",
+                    color: "rgba(255,255,255,0.66)",
+                    fontSize: 11,
+                    fontFamily: "'DM Sans', system-ui, sans-serif",
+                    fontWeight: 500,
+                    cursor: "pointer",
+                    transition: "all 0.15s ease",
+                    letterSpacing: "0.02em",
+                    maxWidth: 250,
+                  }}
+                >
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {savedSearchTimelineLabel}
+                  </span>
+                  <span
+                    style={{
+                      color: "rgba(255,255,255,0.22)",
+                      fontSize: 9,
+                      fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                      whiteSpace: "nowrap",
+                      flexShrink: 0,
+                    }}
+                  >
+                    {savedSearchTimelineCountLabel}
+                  </span>
+                  <span style={{ fontSize: 8, color: "rgba(255,255,255,0.22)" }}>▾</span>
+                </button>
+
+                {searchTimelineScopeOpen && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      top: "calc(100% + 8px)",
+                      right: 0,
+                      width: 280,
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.08)",
+                      background: "#141418",
+                      boxShadow: "0 18px 40px rgba(0,0,0,0.28)",
+                      padding: 6,
+                      zIndex: 20,
+                    }}
+                  >
+                    <div style={{ padding: "0 4px 8px" }}>
+                      <input
+                        ref={searchTimelineInputRef}
+                        value={searchTimelineQuery}
+                        onChange={(event) => setSearchTimelineQuery(event.target.value)}
+                        placeholder="Search saved timelines..."
+                        style={{
+                          width: "100%",
+                          height: 32,
+                          borderRadius: 7,
+                          border: "1px solid rgba(255,255,255,0.07)",
+                          background: "rgba(255,255,255,0.03)",
+                          color: "rgba(255,255,255,0.78)",
+                          fontSize: 11,
+                          fontFamily: "'DM Sans', system-ui, sans-serif",
+                          padding: "0 10px",
+                          boxSizing: "border-box",
+                        }}
+                      />
+                    </div>
+
+                    <div
+                      style={{
+                        maxHeight: 260,
+                        overflowY: "auto",
+                        padding: "0 2px",
+                      }}
+                    >
+                      {timelineOptions.length === 0 ? (
+                        <div
+                          style={{
+                            padding: "10px 8px",
+                            color: "rgba(255,255,255,0.25)",
+                            fontSize: 11,
+                            fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                          }}
+                        >
+                          No saved timelines available
+                        </div>
+                      ) : filteredSearchTimelineOptions.length === 0 ? (
+                        <div
+                          style={{
+                            padding: "10px 8px",
+                            color: "rgba(255,255,255,0.25)",
+                            fontSize: 11,
+                            fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                          }}
+                        >
+                          No matching saved timelines
+                        </div>
+                      ) : (
+                        filteredSearchTimelineOptions.map((option) => {
+                          const timelineKey = option.timeline_uid || option.timeline_name;
+                          const selected = selectedSearchTimelineUid === timelineKey;
+                          return (
+                            <button
+                              key={`saved-search-${timelineKey}`}
+                              onClick={() => handleSavedSearchTimelineSelect(timelineKey)}
+                              style={{
+                                width: "100%",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 10,
+                                padding: "9px 8px",
+                                borderRadius: 7,
+                                border: "none",
+                                background: selected
+                                  ? "rgba(255,255,255,0.07)"
+                                  : "transparent",
+                                color: selected
+                                  ? "rgba(255,255,255,0.82)"
+                                  : "rgba(255,255,255,0.52)",
+                                cursor: "pointer",
+                                textAlign: "left",
+                              }}
+                            >
+                              <span
+                                style={{
+                                  width: 13,
+                                  height: 13,
+                                  borderRadius: 3,
+                                  border: `1px solid ${
+                                    selected
+                                      ? "rgba(255,255,255,0.45)"
+                                      : "rgba(255,255,255,0.15)"
+                                  }`,
+                                  background: selected
+                                    ? "rgba(255,255,255,0.18)"
+                                    : "transparent",
+                                  flexShrink: 0,
+                                }}
+                              />
+                              <span style={{ minWidth: 0, flex: 1 }}>
+                                <span
+                                  style={{
+                                    display: "block",
+                                    fontSize: 11,
+                                    fontFamily: "'DM Sans', system-ui, sans-serif",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  {option.timeline_name}
+                                </span>
+                                <span
+                                  style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 6,
+                                    marginTop: 3,
+                                    color: "rgba(255,255,255,0.26)",
+                                    fontSize: 10,
+                                    fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                                  }}
+                                >
+                                  <span>{option.indexed}/{option.total}</span>
+                                  {option.current && <span>current in Resolve</span>}
+                                </span>
+                              </span>
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <span

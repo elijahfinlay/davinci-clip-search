@@ -125,7 +125,7 @@ def get_settings() -> Settings:
             os.getenv("RESOLVE_CLIP_SEARCH_VISION_TIMEOUT_SEC", "60")
         ),
         gemini_max_attempts=max(
-            int(os.getenv("RESOLVE_CLIP_SEARCH_GEMINI_MAX_ATTEMPTS", "1")),
+            int(os.getenv("RESOLVE_CLIP_SEARCH_GEMINI_MAX_ATTEMPTS", "2")),
             1,
         ),
         yolo_world_model=os.getenv(

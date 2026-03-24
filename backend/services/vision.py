@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import io
 import json
@@ -137,7 +138,137 @@ def _extract_json_block(text: str) -> dict[str, Any]:
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("Vision response did not contain a JSON object.")
-    return json.loads(cleaned[start : end + 1])
+    block = cleaned[start : end + 1]
+    try:
+        return json.loads(block)
+    except json.JSONDecodeError:
+        parsed = ast.literal_eval(block)
+        if not isinstance(parsed, dict):
+            raise ValueError("Vision response JSON object could not be parsed.")
+        return parsed
+
+
+GUIDED_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "shot_type": ("shot_type", "shot type"),
+    "camera_movement": ("camera_movement", "camera movement"),
+    "lighting": ("lighting",),
+    "additional_subjects_or_objects": (
+        "additional_subjects_or_objects",
+        "additional subjects or objects",
+        "additional subjects",
+        "additional objects",
+    ),
+    "clip_type_hint": ("clip_type_hint", "clip type hint"),
+}
+
+GUIDED_FIELD_ALIAS_TO_KEY = {
+    alias.lower(): key
+    for key, aliases in GUIDED_FIELD_ALIASES.items()
+    for alias in aliases
+}
+
+GUIDED_FIELD_PATTERN = re.compile(
+    r'(?is)(?:^|[\n\r,{])\s*[-*]?\s*["\']?(?P<label>'
+    + "|".join(
+        sorted(
+            (re.escape(alias) for alias in GUIDED_FIELD_ALIAS_TO_KEY),
+            key=len,
+            reverse=True,
+        )
+    )
+    + r')["\']?\s*[:=-]'
+)
+
+
+def _clean_guided_scalar(value: str) -> str:
+    cleaned = value.strip().strip(",").strip()
+    if "," in cleaned:
+        cleaned = cleaned.split(",", 1)[0]
+    cleaned = cleaned.strip("{}[]")
+    cleaned = cleaned.strip().strip("\"'`")
+    cleaned = cleaned.strip()
+    if cleaned.lower() in {"none", "n/a", "null"}:
+        return ""
+    return cleaned
+
+
+def _split_guided_list(value: str) -> list[str]:
+    cleaned = value.strip().strip(",").strip()
+    if not cleaned:
+        return []
+
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(cleaned)
+            except Exception:
+                parsed = None
+        if isinstance(parsed, list):
+            return _dedupe(
+                [
+                    _clean_guided_scalar(str(item))
+                    for item in parsed
+                    if _clean_guided_scalar(str(item))
+                ]
+            )
+
+    tokens = [
+        _clean_guided_scalar(token)
+        for token in re.split(r"[\n,;]", cleaned)
+    ]
+    normalized = [
+        re.sub(r"^[-*]\s*", "", token).strip()
+        for token in tokens
+        if token and token.lower() not in {"none", "n/a", "null", "unknown"}
+    ]
+    return _dedupe([token for token in normalized if token])
+
+
+def _extract_guided_payload(text: str) -> dict[str, Any]:
+    try:
+        return _extract_json_block(text)
+    except Exception:
+        pass
+
+    cleaned = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    matches = list(GUIDED_FIELD_PATTERN.finditer(cleaned))
+    if not matches:
+        raise ValueError("Vision response did not contain a JSON object.")
+
+    raw_fields: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        key = GUIDED_FIELD_ALIAS_TO_KEY[match.group("label").lower()]
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
+        raw_value = cleaned[match.end() : value_end].strip().strip(",").strip()
+        raw_fields.setdefault(key, raw_value)
+
+    payload = {
+        "shot_type": _clean_guided_scalar(raw_fields.get("shot_type", "")),
+        "camera_movement": _clean_guided_scalar(raw_fields.get("camera_movement", "")),
+        "lighting": _clean_guided_scalar(raw_fields.get("lighting", "")),
+        "additional_subjects_or_objects": _split_guided_list(
+            raw_fields.get("additional_subjects_or_objects", "")
+        ),
+        "clip_type_hint": _clean_guided_scalar(raw_fields.get("clip_type_hint", "")),
+    }
+    if not any(
+        [
+            payload.get("shot_type"),
+            payload.get("camera_movement"),
+            payload.get("lighting"),
+            payload.get("additional_subjects_or_objects"),
+            payload.get("clip_type_hint"),
+        ]
+    ):
+        raise ValueError("Vision response did not contain a complete guided payload.")
+    return payload
 
 
 def _legacy_multi_frame_offsets(duration_seconds: float) -> list[float]:
@@ -233,6 +364,20 @@ def _build_gemini_guided_prompt(detected_objects: list[str]) -> str:
         '"additional_subjects_or_objects":["..."],'
         '"clip_type_hint":"drone|ground|interview|unknown"}. '
         "Requirements: use short lower-case phrases, do not repeat objects already listed, do not speculate, and return JSON only."
+    )
+
+
+def _build_gemini_guided_repair_prompt(detected_objects: list[str]) -> str:
+    object_text = ", ".join(detected_objects) if detected_objects else "none"
+    return (
+        f"Objects detected: [{object_text}]. "
+        "Return exactly these five lines and nothing else: "
+        "shot type: ... ; "
+        "camera movement: ... ; "
+        "lighting: ... ; "
+        "additional subjects or objects: item 1, item 2 ; "
+        "clip type hint: drone|ground|interview|unknown. "
+        "Use short lower-case phrases, do not repeat already listed objects, and if something is unclear write unknown."
     )
 
 
@@ -381,13 +526,12 @@ def _merge_guided_summary(
     lighting: str,
     additional_subjects_or_objects: list[str],
 ) -> str:
-    subject_bits: list[str] = []
-    if detected_objects:
-        subject_bits.append(f"objects: {', '.join(detected_objects[:6])}")
-    if additional_subjects_or_objects:
-        subject_bits.append(
-            f"additional subjects or objects: {', '.join(additional_subjects_or_objects[:4])}"
-        )
+    subjects = _dedupe(
+        [
+            *detected_objects,
+            *additional_subjects_or_objects,
+        ]
+    )
 
     visual_bits = [
         bit
@@ -400,8 +544,8 @@ def _merge_guided_summary(
     ]
     visual_summary = ", ".join(visual_bits) if visual_bits else f"{clip_type.lower()} clip"
 
-    if subject_bits:
-        return f"{'; '.join(subject_bits)}. {visual_summary}."
+    if subjects:
+        return f"{', '.join(subjects[:8])}. {visual_summary}."
     return f"{visual_summary}."
 
 
@@ -417,7 +561,7 @@ def _guided_analysis_from_response(
     model: str | None,
     cache_signature: str,
 ) -> VisionAnalysis:
-    payload = _extract_json_block(text)
+    payload = _extract_guided_payload(text)
     shot_type = str(payload.get("shot_type") or "").strip().lower()
     camera_movement = str(payload.get("camera_movement") or "").strip().lower()
     lighting = str(payload.get("lighting") or "").strip().lower()
@@ -520,7 +664,7 @@ def _object_aware_fallback_analysis(
     )
     summary = fallback_result.summary.rstrip(".")
     if detected_objects:
-        summary = f"objects: {', '.join(detected_objects[:6])}. {summary}."
+        summary = f"{', '.join(_dedupe(detected_objects)[:6])}. {summary}."
     else:
         summary = f"{summary}."
     return VisionAnalysis(
@@ -909,6 +1053,23 @@ class AnthropicVisionAnalyzer(BaseVisualAnalyzer):
         return content
 
 
+def _extract_gemini_response_text(response: Any) -> str:
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        return json.dumps(parsed)
+
+    text = getattr(response, "text", "") or ""
+    if text:
+        return text
+
+    candidates = getattr(response, "candidates", None) or []
+    return "".join(
+        getattr(part, "text", "")
+        for candidate in candidates
+        for part in getattr(getattr(candidate, "content", None), "parts", []) or []
+    )
+
+
 class GeminiVisionAnalyzer(BaseVisualAnalyzer):
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -1067,15 +1228,7 @@ class GeminiVisionAnalyzer(BaseVisualAnalyzer):
                         responseSchema=GEMINI_GUIDED_RESPONSE_SCHEMA,
                     ),
                 )
-                parsed = getattr(response, "parsed", None)
-                text = json.dumps(parsed) if parsed is not None else (getattr(response, "text", "") or "")
-                if not text:
-                    candidates = getattr(response, "candidates", None) or []
-                    text = "".join(
-                        getattr(part, "text", "")
-                        for candidate in candidates
-                        for part in getattr(getattr(candidate, "content", None), "parts", []) or []
-                    )
+                text = _extract_gemini_response_text(response)
                 return _guided_analysis_from_response(
                     text,
                     clip_type=clip_type,
@@ -1089,6 +1242,39 @@ class GeminiVisionAnalyzer(BaseVisualAnalyzer):
                 )
             except Exception as exc:  # pragma: no cover - depends on external API/runtime
                 last_exc = exc
+
+        try:
+            repair_response = self._client.models.generate_content(
+                model=self.settings.vision_model,
+                contents=[
+                    genai_types.Part.from_bytes(
+                        data=frame.image_bytes,
+                        mime_type="image/jpeg",
+                    ),
+                    genai_types.Part.from_text(
+                        text=_build_gemini_guided_repair_prompt(detected_objects)
+                    ),
+                ],
+                config=genai_types.GenerateContentConfig(
+                    systemInstruction=GEMINI_GUIDED_SYSTEM_PROMPT,
+                    temperature=0,
+                    maxOutputTokens=180,
+                    responseMimeType="text/plain",
+                ),
+            )
+            return _guided_analysis_from_response(
+                _extract_gemini_response_text(repair_response),
+                clip_type=clip_type,
+                fallback=self._fallback,
+                fallback_tags=tags,
+                detected_objects=detected_objects,
+                frame=frame,
+                provider="gemini",
+                model=self.settings.vision_model,
+                cache_signature=cache_signature,
+            )
+        except Exception as exc:  # pragma: no cover - depends on external API/runtime
+            last_exc = exc
 
         LOGGER.warning("Gemini enrichment fallback for %s: %s", clip_name, last_exc)
         return None
