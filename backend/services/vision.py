@@ -517,6 +517,19 @@ def _normalize_detection_label(value: str) -> str:
     return normalized
 
 
+_LABEL_NOISE = {
+    "additional subjects or objects",
+    "additional subjects",
+    "additional objects",
+    "subjects or objects",
+    "additional_subjects_or_objects",
+}
+
+
+def _is_label_noise(value: str) -> bool:
+    return value.strip().lower() in _LABEL_NOISE
+
+
 def _merge_guided_summary(
     *,
     clip_type: str,
@@ -529,7 +542,7 @@ def _merge_guided_summary(
     subjects = _dedupe(
         [
             *detected_objects,
-            *additional_subjects_or_objects,
+            *(item for item in additional_subjects_or_objects if not _is_label_noise(item)),
         ]
     )
 
@@ -570,7 +583,7 @@ def _guided_analysis_from_response(
         [
             str(item)
             for item in raw_additional
-            if str(item).strip()
+            if str(item).strip() and not _is_label_noise(str(item))
         ]
         if isinstance(raw_additional, list)
         else []
@@ -601,7 +614,7 @@ def _guided_analysis_from_response(
             shot_type,
             camera_movement,
             lighting,
-            *additional_subjects_or_objects,
+            *(item for item in additional_subjects_or_objects if not _is_label_noise(item)),
             str(payload.get("clip_type_hint") or ""),
         ]
     )

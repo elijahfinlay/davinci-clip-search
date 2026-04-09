@@ -145,8 +145,8 @@ class SearchService:
         parsed = self.parse_query(raw_query)
         rows = self.store.get_search_rows(
             clip_type=canonical_clip_type(clip_type),
-            timeline_uid=timeline_uid if scope == "current" else None,
-            timeline_name=timeline_name if scope == "current" else None,
+            timeline_uid=timeline_uid if scope in {"current", "saved"} else None,
+            timeline_name=timeline_name if scope in {"current", "saved"} else None,
         )
 
         ranked: list[tuple[float, dict[str, Any]]] = []

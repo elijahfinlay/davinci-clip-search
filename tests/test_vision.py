@@ -54,7 +54,7 @@ class VisionPipelineTests(unittest.TestCase):
             detected_objects=["person", "microphone"],
             frame=ExtractedFrame(frame_offset_sec=3.5, image_bytes=b""),
             provider="gemini",
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite",
             cache_signature="test-signature",
         )
         self.assertTrue(analysis.summary.startswith("person, microphone, podium"))
@@ -81,7 +81,7 @@ class VisionPipelineTests(unittest.TestCase):
             detected_objects=["person", "bench"],
             frame=ExtractedFrame(frame_offset_sec=4.0, image_bytes=b""),
             provider="gemini",
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite",
             cache_signature="test-signature",
         )
         self.assertTrue(analysis.summary.startswith("person, bench, campus building"))
@@ -98,7 +98,7 @@ class VisionPipelineTests(unittest.TestCase):
             detected_objects=["person"],
             frame=ExtractedFrame(frame_offset_sec=1.5, image_bytes=b""),
             provider="gemini",
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite",
             cache_signature="test-signature",
         )
         self.assertIn("wide shot", analysis.summary)

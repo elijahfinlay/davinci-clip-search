@@ -296,7 +296,17 @@ function mergeResultsWithLiveItems(results, liveItems) {
     return results;
   }
   const liveIds = new Set(liveItems.map((item) => item.id));
-  return [...liveItems, ...results.filter((item) => !liveIds.has(item.id))];
+  const merged = [...liveItems, ...results.filter((item) => !liveIds.has(item.id))];
+  merged.sort((a, b) => {
+    const tA = a.timeline || "";
+    const tB = b.timeline || "";
+    if (tA !== tB) return tA.localeCompare(tB);
+    if ((a.track || 0) !== (b.track || 0)) return (a.track || 0) - (b.track || 0);
+    const tcA = a.timecode || "";
+    const tcB = b.timecode || "";
+    return tcA.localeCompare(tcB);
+  });
+  return merged;
 }
 
 function SearchIcon() {
@@ -613,7 +623,8 @@ export default function ResolveClipSearch() {
     : results;
   const visibleResults = displayedResults.slice(0, renderCount);
   const canLiveRefreshSearch = Boolean(
-    query.trim()
+    isBusy
+    || query.trim()
     || searchScope === "current"
     || searchScope === "saved"
     || activeFilter !== "All"
@@ -623,6 +634,10 @@ export default function ResolveClipSearch() {
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    setRenderCount(INITIAL_RESULT_BATCH);
+  }, [query, activeFilter, searchScope]);
 
   useEffect(() => {
     if (!filterOptions.some((option) => option.toLowerCase() === activeFilter.toLowerCase())) {
@@ -934,7 +949,7 @@ export default function ResolveClipSearch() {
       setSelectedId(null);
       return;
     }
-    setRenderCount(Math.min(INITIAL_RESULT_BATCH, displayedResults.length));
+    setRenderCount((current) => Math.max(current, Math.min(INITIAL_RESULT_BATCH, displayedResults.length)));
     if (selectedId && displayedResults.some((clip) => clip.id === selectedId)) {
       return;
     }

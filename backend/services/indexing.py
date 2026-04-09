@@ -5,6 +5,7 @@ import json
 import queue
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1348,55 +1349,63 @@ class ReindexCoordinator:
                 exc if isinstance(exc, ResolveConnectionError) else ResolveConnectionError(str(exc))
             )
 
+    def _enrich_single(self, task: EnrichmentTask) -> tuple[EnrichmentTask, ClipRecord | None, str | None]:
+        try:
+            enriched = self.indexing_service.enrich_clip(task.clip)
+            return (task, enriched, None)
+        except Exception as exc:
+            return (task, None, str(exc))
+
     def _run_enrichment(
         self,
         *,
         tasks: list[EnrichmentTask],
         project_meta: ProjectIndexMeta,
     ) -> None:
+        workers = getattr(self.indexing_service.settings, "enrichment_workers", 4)
         try:
-            for index, task in enumerate(tasks, start=1):
-                if self._is_cancel_requested():
+            completed_count = 0
+            total = len(tasks)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {}
+                for task in tasks:
+                    if self._is_cancel_requested():
+                        break
+                    future = pool.submit(self._enrich_single, task)
+                    futures[future] = task
+
+                for future in as_completed(futures):
+                    if self._is_cancel_requested():
+                        for pending in futures:
+                            pending.cancel()
+                        break
+
+                    task, enriched_clip, error = future.result()
+                    completed_count += 1
+
+                    if error:
+                        with self._lock:
+                            self._state.last_error = error
+
+                    if enriched_clip:
+                        self.indexing_service.store.upsert_clip(
+                            enriched_clip,
+                            indexed_at=now_iso(),
+                        )
+                        with self._lock:
+                            self._state.latest_clip = clip_record_to_result(enriched_clip)
+                            self._state.latest_clip_stage = "Gemini enrichment complete"
+
                     with self._lock:
-                        self._state.enrichment_running = False
-                        self._state.message = "Gemini enrichment stopped"
-                        self._state.finished_at = now_iso()
-                        self._state.active_clip_index = 0
-                        self._state.active_clip_name = None
+                        clip_name = task.clip.file_name or task.clip.clip_name
+                        self._state.enriched_clips = completed_count
+                        self._state.total_enrichment_clips = total
+                        self._state.enrichment_progress = min(completed_count / total, 1.0)
+                        self._state.active_clip_index = completed_count
+                        self._state.active_clip_name = clip_name
+                        self._state.message = f"Gemini enriched {completed_count}/{total} clips"
                         self._broadcast_locked()
-                    return
-                with self._lock:
-                    self._state.active_clip_index = index
-                    self._state.active_clip_name = task.clip.file_name or task.clip.clip_name
-                    self._state.message = (
-                        f"Gemini enriching {index}/{len(tasks)}: "
-                        f"{task.clip.file_name or task.clip.clip_name}"
-                    )
-                    self._broadcast_locked()
-
-                try:
-                    enriched_clip = self.indexing_service.enrich_clip(task.clip)
-                except Exception as exc:
-                    enriched_clip = None
-                    with self._lock:
-                        self._state.last_error = str(exc)
-
-                if enriched_clip:
-                    self.indexing_service.store.upsert_clip(
-                        enriched_clip,
-                        indexed_at=now_iso(),
-                    )
-                    with self._lock:
-                        self._state.latest_clip = clip_record_to_result(enriched_clip)
-                        self._state.latest_clip_stage = "Gemini enrichment complete"
-
-                with self._lock:
-                    self._state.enriched_clips = index
-                    self._state.total_enrichment_clips = len(tasks)
-                    if tasks:
-                        self._state.enrichment_progress = min(index / len(tasks), 1.0)
-                    self._state.message = f"Gemini enriched {index}/{len(tasks)} clips"
-                    self._broadcast_locked()
 
             if self._is_cancel_requested():
                 with self._lock:

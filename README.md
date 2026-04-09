@@ -111,7 +111,7 @@ Then start the backend and open:
 - `RESOLVE_CLIP_SEARCH_VISION_PROVIDER`: defaults to `gemini` when `GEMINI_API_KEY` is present, otherwise `anthropic` when `ANTHROPIC_API_KEY` is present, otherwise `heuristic`
 - `GEMINI_API_KEY`: enables Gemini vision indexing
 - `ANTHROPIC_API_KEY`: optional alternative provider
-- `RESOLVE_CLIP_SEARCH_VISION_MODEL`: defaults to `gemini-2.5-flash` for Gemini and `claude-sonnet-4-6` for Anthropic
+- `RESOLVE_CLIP_SEARCH_VISION_MODEL`: defaults to `gemini-3.1-flash-lite` for Gemini and `claude-sonnet-4-6` for Anthropic
 - `RESOLVE_CLIP_SEARCH_VISION_MAX_IMAGE_EDGE_PX`: defaults to `768`
 - `RESOLVE_CLIP_SEARCH_VISION_TIMEOUT_SEC`: defaults to `60`
 

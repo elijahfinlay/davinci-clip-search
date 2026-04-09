@@ -31,6 +31,7 @@ class Settings:
     yolo_world_model: str
     yolo_world_confidence: float
     yolo_world_max_objects: int
+    enrichment_workers: int
     thumbnail_cache_version: str
     thumbnail_source_width: int
     thumbnail_source_height: int
@@ -73,7 +74,7 @@ def _default_vision_provider() -> str:
 def _default_vision_model(provider: str) -> str:
     normalized = provider.strip().lower()
     if normalized == "gemini":
-        return "gemini-2.5-flash"
+        return "gemini-3.1-flash-lite"
     if normalized == "anthropic":
         return "claude-sonnet-4-6"
     return "heuristic"
@@ -137,6 +138,10 @@ def get_settings() -> Settings:
         ),
         yolo_world_max_objects=int(
             os.getenv("RESOLVE_CLIP_SEARCH_YOLO_WORLD_MAX_OBJECTS", "14")
+        ),
+        enrichment_workers=max(
+            int(os.getenv("RESOLVE_CLIP_SEARCH_ENRICHMENT_WORKERS", "4")),
+            1,
         ),
         thumbnail_cache_version=os.getenv(
             "RESOLVE_CLIP_SEARCH_THUMBNAIL_CACHE_VERSION",
