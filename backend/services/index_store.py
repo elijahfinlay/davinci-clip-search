@@ -134,8 +134,21 @@ class IndexStore:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_stats(self) -> dict[str, Any]:
-        project = self.get_latest_project_meta()
+    def get_project_meta(self, project_uid: str | None) -> dict[str, Any] | None:
+        if not project_uid:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_uid = ?",
+                (project_uid,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def resolve_project_meta(self, project_uid: str | None) -> dict[str, Any] | None:
+        return self.get_project_meta(project_uid) or self.get_latest_project_meta()
+
+    def get_stats(self, project_uid: str | None = None) -> dict[str, Any]:
+        project = self.resolve_project_meta(project_uid)
         if not project:
             return {
                 "project_name": None,
@@ -722,8 +735,9 @@ class IndexStore:
         clip_type: str | None = None,
         timeline_uid: str | None = None,
         timeline_name: str | None = None,
+        project_uid: str | None = None,
     ) -> list[dict[str, Any]]:
-        project = self.get_latest_project_meta()
+        project = self.resolve_project_meta(project_uid)
         if not project:
             return []
 

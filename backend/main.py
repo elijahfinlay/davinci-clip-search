@@ -62,6 +62,15 @@ def health() -> HealthModel:
     return HealthModel()
 
 
+def _active_indexed_project_uid(resolve_status) -> str | None:
+    if not resolve_status.connected:
+        return None
+    uid = getattr(resolve_status, "project_uid", None)
+    if not uid:
+        return None
+    return uid if store.get_project_meta(uid) else None
+
+
 @app.get("/api/status", response_model=StatusResponseModel)
 def status() -> StatusResponseModel:
     reindex_state = reindexer.snapshot()
@@ -70,7 +79,8 @@ def status() -> StatusResponseModel:
         if reindex_state.running
         else resolve.get_status()
     )
-    stats = store.get_stats()
+    active_project_uid = _active_indexed_project_uid(resolve_status)
+    stats = store.get_stats(project_uid=active_project_uid)
     is_stale = False
     project_coverage = None
     current_timeline_coverage = None
@@ -199,7 +209,7 @@ def status() -> StatusResponseModel:
         total=stats["total"],
         timelines=stats["timelines"],
         last_indexed=stats["last_indexed"],
-        available_types=search_service.build_filter_options(),
+        available_types=search_service.build_filter_options(project_uid=active_project_uid),
         is_stale=is_stale,
         quick_mode=stats["quick_mode"],
         storage_format=stats["storage_format"],
@@ -237,6 +247,7 @@ def search(
 
     resolved_timeline_uid = None
     resolved_timeline_name = None
+    resolve_status = None
     if search_scope == "current":
         resolve_status = resolve.get_status()
         if not resolve_status.connected:
@@ -251,12 +262,17 @@ def search(
         resolved_timeline_uid = timeline_uid
         resolved_timeline_name = timeline_name
 
+    if resolve_status is None:
+        resolve_status = resolve.get_cached_status()
+    active_project_uid = _active_indexed_project_uid(resolve_status)
+
     payload = search_service.search(
         q,
         clip_type=clip_type,
         scope=search_scope,
         timeline_uid=resolved_timeline_uid,
         timeline_name=resolved_timeline_name,
+        project_uid=active_project_uid,
         limit=limit,
     )
     return SearchResponseModel(**payload)

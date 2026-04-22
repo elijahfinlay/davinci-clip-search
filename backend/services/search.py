@@ -68,8 +68,8 @@ class SearchService:
     def __init__(self, store: IndexStore) -> None:
         self.store = store
 
-    def build_filter_options(self) -> list[str]:
-        stats = self.store.get_stats()
+    def build_filter_options(self, project_uid: str | None = None) -> list[str]:
+        stats = self.store.get_stats(project_uid=project_uid)
         dynamic = [
             display_clip_type(item)
             for item in stats["available_types"]
@@ -140,6 +140,7 @@ class SearchService:
         scope: str = "all",
         timeline_uid: str | None = None,
         timeline_name: str | None = None,
+        project_uid: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
         parsed = self.parse_query(raw_query)
@@ -147,6 +148,7 @@ class SearchService:
             clip_type=canonical_clip_type(clip_type),
             timeline_uid=timeline_uid if scope in {"current", "saved"} else None,
             timeline_name=timeline_name if scope in {"current", "saved"} else None,
+            project_uid=project_uid,
         )
 
         ranked: list[tuple[float, dict[str, Any]]] = []
