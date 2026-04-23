@@ -71,6 +71,8 @@ function ClipThumbnail({ type, index, thumbnail }) {
     handheld: ["#3a2a1a", "#6a4a2a", "#a07040"],
     ground: ["#3a2a1a", "#6a4a2a", "#a07040"],
     interview: ["#2a2a3a", "#4a4a6a", "#6a6a9a"],
+    generator: ["#1e2228", "#2e333c", "#444a54"],
+    transition: ["#1e2228", "#2e333c", "#444a54"],
   };
   const colors = gradients[type] || gradients.handheld;
 
@@ -263,6 +265,8 @@ function TypeBadge({ type }) {
     handheld: { color: "#b08a4a", bg: "rgba(176,138,74,0.1)", border: "rgba(176,138,74,0.2)" },
     ground: { color: "#b08a4a", bg: "rgba(176,138,74,0.1)", border: "rgba(176,138,74,0.2)" },
     interview: { color: "#8a7ab0", bg: "rgba(138,122,176,0.1)", border: "rgba(138,122,176,0.2)" },
+    generator: { color: "#6d7a8a", bg: "rgba(109,122,138,0.1)", border: "rgba(109,122,138,0.2)" },
+    transition: { color: "#6d7a8a", bg: "rgba(109,122,138,0.1)", border: "rgba(109,122,138,0.2)" },
   };
   const c = config[type] || config.handheld;
   const label = TYPE_LABELS[type] || type;
@@ -353,6 +357,15 @@ function JumpIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
       <path d="M2 10L10 2M10 2H4M10 2V8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <path d="M6 1.5V8M6 8L3 5M6 8L9 5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+      <path d="M1.75 9.5V10.25C1.75 10.6642 2.08579 11 2.5 11H9.5C9.91421 11 10.25 10.6642 10.25 10.25V9.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
   );
 }
@@ -1049,6 +1062,47 @@ export default function ResolveClipSearch() {
     }
   }
 
+  async function handleExport() {
+    try {
+      const response = await fetch("/api/export");
+      if (!response.ok) {
+        let message = "Export failed";
+        try {
+          const body = await response.json();
+          message = body.detail || message;
+        } catch {
+          message = response.statusText || message;
+        }
+        throw new Error(message);
+      }
+
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = disposition.match(/filename="?([^"]+)"?/i);
+      const fallback = `${(status.index.project_name || "clip-index").replace(/[^a-z0-9_-]+/gi, "_")}-clips.json`;
+      const filename = match ? match[1] : fallback;
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      setToast({
+        type: "success",
+        message: `Downloaded ${filename}`,
+      });
+    } catch (error) {
+      setToast({
+        type: "error",
+        message: error.message || "Export failed",
+      });
+    }
+  }
+
   async function handleCancelReindex() {
     try {
       const nextState = await request("/api/reindex/cancel", {
@@ -1569,6 +1623,42 @@ export default function ResolveClipSearch() {
                 </div>
               )}
             </div>
+            {(() => {
+              const exportDisabled = isBusy || !status.index.total;
+              return (
+                <button
+                  onClick={handleExport}
+                  disabled={exportDisabled}
+                  title={status.index.total ? "Download indexed clips as JSON" : "Nothing indexed to download yet"}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 5,
+                    padding: "3px 8px",
+                    borderRadius: 4,
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    background: "transparent",
+                    color: "rgba(255,255,255,0.3)",
+                    fontSize: 10,
+                    fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                    cursor: exportDisabled ? "default" : "pointer",
+                    transition: "all 0.15s ease",
+                    opacity: exportDisabled ? 0.45 : 1,
+                  }}
+                  onMouseEnter={(event) => {
+                    if (exportDisabled) return;
+                    event.currentTarget.style.borderColor = "rgba(255,255,255,0.15)";
+                    event.currentTarget.style.color = "rgba(255,255,255,0.5)";
+                  }}
+                  onMouseLeave={(event) => {
+                    event.currentTarget.style.borderColor = "rgba(255,255,255,0.08)";
+                    event.currentTarget.style.color = "rgba(255,255,255,0.3)";
+                  }}
+                >
+                  <DownloadIcon /> Download
+                </button>
+              );
+            })()}
             <button
               onClick={handleReindex}
               disabled={isBusy}

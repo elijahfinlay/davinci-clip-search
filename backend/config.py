@@ -74,7 +74,7 @@ def _default_vision_provider() -> str:
 def _default_vision_model(provider: str) -> str:
     normalized = provider.strip().lower()
     if normalized == "gemini":
-        return "gemini-3.1-flash-lite"
+        return "gemini-flash-lite-latest"
     if normalized == "anthropic":
         return "claude-sonnet-4-6"
     return "heuristic"

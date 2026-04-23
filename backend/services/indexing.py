@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import queue
 import re
 import threading
@@ -27,6 +28,9 @@ from .types import (
     VisualDescription,
 )
 from .vision import build_visual_analyzer
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 ProgressCallback = Callable[[ReindexState], None]
@@ -120,6 +124,52 @@ def nearby_markers(
     return matches
 
 
+TRANSITION_NAMES = {
+    "cross dissolve",
+    "dip to color",
+    "dip to white",
+    "dip to black",
+    "fade in",
+    "fade out",
+    "fade to color",
+    "smooth cut",
+    "wipe",
+    "additive dissolve",
+    "non-additive dissolve",
+    "film dissolve",
+}
+
+GENERATOR_NAMES = {
+    "solid color",
+    "gradient",
+    "noise",
+    "text",
+    "text+",
+    "custom text",
+    "mandelbrot",
+    "checkerboard",
+    "grid",
+    "lens flare",
+    "timecode generator",
+}
+
+
+def infer_generator_kind(
+    *,
+    clip_name: str,
+    has_media_pool_item: bool,
+    file_path: str,
+) -> str | None:
+    if has_media_pool_item and file_path:
+        return None
+    normalized = clip_name.strip().lower()
+    if normalized in TRANSITION_NAMES:
+        return "transition"
+    if normalized in GENERATOR_NAMES:
+        return "generator"
+    return "generator"
+
+
 def infer_clip_type(
     *,
     clip_name: str,
@@ -128,7 +178,10 @@ def infer_clip_type(
     tags: list[str],
     transcript: str | None,
     file_path: str,
+    generator_kind: str | None = None,
 ) -> str:
+    if generator_kind:
+        return generator_kind
     haystack = " ".join(
         [clip_name, timeline_name, track_name, " ".join(tags), transcript or "", file_path]
     ).lower()
@@ -181,6 +234,9 @@ def build_description(
     transcript: str | None,
     visual_descriptions: list[VisualDescription],
 ) -> str:
+    if clip_type in {"transition", "generator"}:
+        kind = "transition" if clip_type == "transition" else "generator"
+        return f"{clip_name} {kind} on {timeline_name} / {track_name}"
     if visual_descriptions:
         return visual_descriptions[0].description
     if transcript:
@@ -591,26 +647,45 @@ class IndexingService:
                         if progress_callback:
                             progress_callback(state)
 
-                        build_result = self._build_clip_record(
-                            project=project,
-                            signature=signature,
-                            timeline=timeline,
-                            timeline_uid=timeline_uid,
-                            timeline_name=timeline_name,
-                            timeline_index=timeline_index,
-                            timeline_start_frame=timeline_start_frame,
-                            timeline_start_tc=timeline_start_tc,
-                            timeline_fps=timeline_fps,
-                            drop_frame=drop_frame,
-                            track_index=track_index,
-                            track_name=track_name,
-                            item_index=item_index,
-                            item=item,
-                            timeline_markers=timeline_markers,
-                            existing_cache_by_clip_id=existing_cache_by_clip_id,
-                            existing_cache_by_content_signature=existing_cache_by_content_signature,
-                            quick_mode=quick_mode,
-                        )
+                        try:
+                            build_result = self._build_clip_record(
+                                project=project,
+                                signature=signature,
+                                timeline=timeline,
+                                timeline_uid=timeline_uid,
+                                timeline_name=timeline_name,
+                                timeline_index=timeline_index,
+                                timeline_start_frame=timeline_start_frame,
+                                timeline_start_tc=timeline_start_tc,
+                                timeline_fps=timeline_fps,
+                                drop_frame=drop_frame,
+                                track_index=track_index,
+                                track_name=track_name,
+                                item_index=item_index,
+                                item=item,
+                                timeline_markers=timeline_markers,
+                                existing_cache_by_clip_id=existing_cache_by_clip_id,
+                                existing_cache_by_content_signature=existing_cache_by_content_signature,
+                                quick_mode=quick_mode,
+                            )
+                        except IndexingCancelledError:
+                            raise
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "Skipping clip %r on %r/%s: %s",
+                                clip_label,
+                                timeline_name,
+                                track_name,
+                                exc,
+                            )
+                            current_indexed += 1
+                            state.processed_clips = current_indexed
+                            if total_target_clips:
+                                state.progress = min(current_indexed / total_target_clips, 1.0)
+                            state.last_error = f"Skipped {clip_label}: {exc}"
+                            if progress_callback:
+                                progress_callback(state)
+                            continue
                         clip = build_result.clip
                         self.store.upsert_clip(clip, indexed_at=run_indexed_at)
                         seen_clip_ids.add(clip.clip_id)
@@ -799,6 +874,11 @@ class IndexingService:
             markers=all_markers + near_markers,
             transcript=transcript,
         )
+        generator_kind = infer_generator_kind(
+            clip_name=clip_name,
+            has_media_pool_item=bool(media_pool_item),
+            file_path=file_path,
+        )
         clip_type = infer_clip_type(
             clip_name=clip_name,
             timeline_name=timeline_name,
@@ -806,6 +886,7 @@ class IndexingService:
             tags=tags,
             transcript=transcript,
             file_path=file_path,
+            generator_kind=generator_kind,
         )
         tags = dedupe(tags + [clip_type])
 

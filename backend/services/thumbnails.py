@@ -68,40 +68,46 @@ class ThumbnailService:
     def _is_current_thumbnail(self, data_uri: str) -> bool:
         return f"preview={self.settings.thumbnail_cache_version}" in data_uri
 
+    _STILL_IMAGE_SUFFIXES = {
+        ".jpg", ".jpeg", ".jpe", ".png", ".gif", ".bmp",
+        ".tif", ".tiff", ".webp", ".heic", ".heif", ".avif",
+    }
+
     def _extract_preview_bytes(self, file_path: str) -> bytes | None:
-        for timestamp in ("1.0", "0.0"):
+        is_still = Path(file_path).suffix.lower() in self._STILL_IMAGE_SUFFIXES
+        attempts: list[str | None] = [None] if is_still else ["1.0", "0.0"]
+        for timestamp in attempts:
             try:
-                result = subprocess.run(
-                    [
-                        self._ffmpeg,
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-ss",
-                        timestamp,
-                        "-i",
-                        file_path,
-                        "-frames:v",
-                        "1",
-                        "-vf",
-                        (
-                            f"scale={self.settings.thumbnail_source_width}:"
-                            f"{self.settings.thumbnail_source_height}:"
-                            "force_original_aspect_ratio=increase,"
-                            f"crop={self.settings.thumbnail_source_width}:"
-                            f"{self.settings.thumbnail_source_height}"
-                        ),
-                        "-q:v",
-                        str(self.settings.thumbnail_jpeg_quality),
-                        "-f",
-                        "image2pipe",
-                        "-vcodec",
-                        "mjpeg",
-                        "-",
-                    ],
-                    capture_output=True,
-                    check=False,
-                )
+                cmd = [
+                    self._ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                ]
+                if timestamp is not None:
+                    cmd += ["-ss", timestamp]
+                cmd += [
+                    "-i",
+                    file_path,
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    (
+                        f"scale={self.settings.thumbnail_source_width}:"
+                        f"{self.settings.thumbnail_source_height}:"
+                        "force_original_aspect_ratio=increase,"
+                        f"crop={self.settings.thumbnail_source_width}:"
+                        f"{self.settings.thumbnail_source_height}"
+                    ),
+                    "-q:v",
+                    str(self.settings.thumbnail_jpeg_quality),
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "mjpeg",
+                    "-",
+                ]
+                result = subprocess.run(cmd, capture_output=True, check=False)
             except OSError as exc:
                 LOGGER.warning("Thumbnail extraction skipped for %s: %s", file_path, exc)
                 return None

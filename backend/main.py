@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -358,6 +359,45 @@ def jump(request: JumpRequestModel) -> JumpResponseModel:
         clip_id=request.clip_id,
         timeline_name=result["timeline_name"],
         start_timecode=result["start_timecode"],
+    )
+
+
+@app.get("/api/export", response_model=None)
+def export_index() -> Response:
+    resolve_status = resolve.get_cached_status()
+    active_project_uid = _active_indexed_project_uid(resolve_status)
+    stats = store.get_stats(project_uid=active_project_uid)
+    project_uid = stats.get("project_uid")
+
+    if not project_uid:
+        raise HTTPException(status_code=404, detail="No indexed clips available to export.")
+
+    clips = store.get_export_rows(project_uid)
+    payload = {
+        "project_name": stats.get("project_name"),
+        "project_uid": project_uid,
+        "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "last_indexed": stats.get("last_indexed"),
+        "total_clips": stats.get("total"),
+        "total_timelines": stats.get("timelines"),
+        "quick_mode": stats.get("quick_mode"),
+        "available_types": stats.get("available_types", []),
+        "clips": clips,
+    }
+
+    body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    safe_name = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_"
+        for ch in (stats.get("project_name") or "clip-index")
+    ).strip("_") or "clip-index"
+    filename = f"{safe_name}-clips.json"
+
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
     )
 
 

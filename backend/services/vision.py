@@ -381,6 +381,22 @@ def _build_gemini_guided_repair_prompt(detected_objects: list[str]) -> str:
     )
 
 
+_STILL_IMAGE_SUFFIXES = {
+    ".jpg",
+    ".jpeg",
+    ".jpe",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
+    ".heic",
+    ".heif",
+    ".avif",
+}
+
+
 def _extract_frames(
     *,
     ffmpeg_binary: str | None,
@@ -391,47 +407,73 @@ def _extract_frames(
     if not ffmpeg_binary:
         return []
 
-    frames: list[ExtractedFrame] = []
     scale_filter = (
         "scale="
         f"'if(gt(iw,ih),{settings.vision_max_image_edge_px},-2)':"
         f"'if(gt(iw,ih),-2,{settings.vision_max_image_edge_px})'"
     )
 
-    for offset in _dedupe_float_offsets(offsets):
-        result = subprocess.run(
-            [
-                ffmpeg_binary,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                str(offset),
-                "-i",
-                str(file_path),
-                "-frames:v",
-                "1",
-                "-vf",
-                scale_filter,
-                "-q:v",
-                "5",
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "mjpeg",
-                "-",
-            ],
-            capture_output=True,
-            check=False,
+    is_still_image = file_path.suffix.lower() in _STILL_IMAGE_SUFFIXES
+    requested_offsets = _dedupe_float_offsets(offsets)
+
+    if is_still_image:
+        still = _run_ffmpeg_extract(
+            ffmpeg_binary=ffmpeg_binary,
+            file_path=file_path,
+            offset=None,
+            scale_filter=scale_filter,
         )
-        if result.returncode == 0 and result.stdout:
+        if not still:
+            return []
+        return [
+            ExtractedFrame(frame_offset_sec=offset, image_bytes=still)
+            for offset in requested_offsets
+        ]
+
+    frames: list[ExtractedFrame] = []
+    for offset in requested_offsets:
+        data = _run_ffmpeg_extract(
+            ffmpeg_binary=ffmpeg_binary,
+            file_path=file_path,
+            offset=offset,
+            scale_filter=scale_filter,
+        )
+        if data:
             frames.append(
-                ExtractedFrame(
-                    frame_offset_sec=offset,
-                    image_bytes=result.stdout,
-                )
+                ExtractedFrame(frame_offset_sec=offset, image_bytes=data)
             )
     return frames
+
+
+def _run_ffmpeg_extract(
+    *,
+    ffmpeg_binary: str,
+    file_path: Path,
+    offset: float | None,
+    scale_filter: str,
+) -> bytes | None:
+    cmd: list[str] = [ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
+    if offset is not None:
+        cmd += ["-ss", str(offset)]
+    cmd += [
+        "-i",
+        str(file_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        scale_filter,
+        "-q:v",
+        "5",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, check=False)
+    if result.returncode == 0 and result.stdout:
+        return result.stdout
+    return None
 
 
 def _analysis_from_legacy_response(
@@ -794,10 +836,15 @@ class HeuristicVisualAnalyzer(BaseVisualAnalyzer):
         duration_seconds: float,
         partial_callback: Callable[[VisionAnalysis], None] | None = None,
     ) -> VisionAnalysis:
-        description_tags = ", ".join(tags[:6]) if tags else clip_type
-        summary = f"{clip_type.title()} clip with {description_tags}"
-        if file_path:
-            summary = f"{summary}. Source: {Path(file_path).name}"
+        if clip_type in {"transition", "generator"}:
+            kind = "transition" if clip_type == "transition" else "generator"
+            name = clip_name.strip() or clip_type.title()
+            summary = f"{name} {kind}"
+        else:
+            description_tags = ", ".join(tags[:6]) if tags else clip_type
+            summary = f"{clip_type.title()} clip with {description_tags}"
+            if file_path:
+                summary = f"{summary}. Source: {Path(file_path).name}"
         return VisionAnalysis(
             summary=summary,
             tags=_dedupe(tags[:12]),

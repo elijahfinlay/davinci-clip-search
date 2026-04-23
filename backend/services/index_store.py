@@ -762,6 +762,29 @@ class IndexStore:
             rows = conn.execute(query, params).fetchall()
         return [self._deserialize_row(row) for row in rows]
 
+    def get_export_rows(self, project_uid: str | None = None) -> list[dict[str, Any]]:
+        project = self.resolve_project_meta(project_uid)
+        if not project:
+            return []
+
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM clips
+                WHERE project_uid = ?
+                ORDER BY timeline_index ASC, track ASC, start_frame ASC
+                """,
+                (project["project_uid"],),
+            ).fetchall()
+
+        deserialized: list[dict[str, Any]] = []
+        for row in rows:
+            data = self._deserialize_row(row)
+            data.pop("thumbnail_data", None)
+            deserialized.append(data)
+        return deserialized
+
     def _deserialize_row(self, row: sqlite3.Row | None) -> dict[str, Any]:
         if row is None:
             return {}
