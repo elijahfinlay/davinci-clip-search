@@ -305,6 +305,7 @@ class ResolveFacade:
         timeline_count = safe_call(project.GetTimelineCount, default=0) or 0
         preferred_timelines: list[tuple[Any, str | None, str]] = []
         other_timelines: list[tuple[Any, str | None, str]] = []
+        preferred_keys: set[str] = set()
         fallback_timeline = None
         for timeline_index in range(1, timeline_count + 1):
             timeline = safe_call(project.GetTimelineByIndex, timeline_index)
@@ -315,10 +316,16 @@ class ResolveFacade:
             if timeline_uid and candidate_uid == timeline_uid:
                 preferred_timelines.insert(0, (timeline, candidate_uid, candidate_name))
                 fallback_timeline = timeline
+                if candidate_uid:
+                    preferred_keys.add(candidate_uid)
+                preferred_keys.add(candidate_name)
                 continue
             if candidate_name == timeline_name:
                 preferred_timelines.append((timeline, candidate_uid, candidate_name))
                 fallback_timeline = fallback_timeline or timeline
+                if candidate_uid:
+                    preferred_keys.add(candidate_uid)
+                preferred_keys.add(candidate_name)
                 continue
             other_timelines.append((timeline, candidate_uid, candidate_name))
 
@@ -333,6 +340,7 @@ class ResolveFacade:
         resolved_target = self._find_live_clip_location(
             project=project,
             timelines=preferred_timelines + other_timelines,
+            preferred_keys=preferred_keys,
             clip_id=clip_id,
             clip_name=clip_name,
             file_path=file_path,
@@ -374,6 +382,7 @@ class ResolveFacade:
         *,
         project: Any,
         timelines: list[tuple[Any, str | None, str]],
+        preferred_keys: set[str],
         clip_id: str,
         clip_name: str | None,
         file_path: str | None,
@@ -383,9 +392,20 @@ class ResolveFacade:
     ) -> dict[str, Any] | None:
         normalized_clip_name = (clip_name or "").strip().lower()
         normalized_file_path = _normalize_path(file_path)
-        best_fallback: tuple[tuple[int, int, int], dict[str, Any]] | None = None
+        # Score-based fallbacks are tracked per-bucket so any candidate on the
+        # indexed (preferred) timeline beats every candidate on a non-preferred
+        # timeline — even when a non-preferred match scores higher in
+        # isolation. The indexed row's timeline_uid/name is the user's intent;
+        # other timelines that happen to share the source clip should never
+        # hijack the jump.
+        best_preferred: tuple[tuple[int, int, int], dict[str, Any]] | None = None
+        best_other: tuple[tuple[int, int, int], dict[str, Any]] | None = None
 
         for timeline, candidate_uid, candidate_name in timelines:
+            is_preferred = (
+                (candidate_uid is not None and candidate_uid in preferred_keys)
+                or (candidate_name in preferred_keys)
+            )
             track_count = safe_call(timeline.GetTrackCount, "video", default=0) or 0
             for candidate_track_index in range(1, track_count + 1):
                 items = safe_call(
@@ -444,10 +464,16 @@ class ResolveFacade:
                         "timeline_name": candidate_name,
                         "start_timecode": start_timecode,
                     }
-                    if not best_fallback or ranking > best_fallback[0]:
-                        best_fallback = (ranking, candidate)
+                    if is_preferred:
+                        if not best_preferred or ranking > best_preferred[0]:
+                            best_preferred = (ranking, candidate)
+                    else:
+                        if not best_other or ranking > best_other[0]:
+                            best_other = (ranking, candidate)
 
-        return best_fallback[1] if best_fallback else None
+        if best_preferred:
+            return best_preferred[1]
+        return best_other[1] if best_other else None
 
     @staticmethod
     def _frame_delta(*, indexed_timecode: str, candidate_timecode: str, fps: float) -> int:
