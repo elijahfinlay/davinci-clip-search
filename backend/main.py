@@ -373,7 +373,7 @@ def export_index() -> Response:
         raise HTTPException(status_code=404, detail="No indexed clips available to export.")
 
     clips = store.get_export_rows(project_uid)
-    payload = {
+    header = {
         "project_name": stats.get("project_name"),
         "project_uid": project_uid,
         "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -382,21 +382,34 @@ def export_index() -> Response:
         "total_timelines": stats.get("timelines"),
         "quick_mode": stats.get("quick_mode"),
         "available_types": stats.get("available_types", []),
-        "clips": clips,
     }
 
-    body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
     safe_name = "".join(
         ch if ch.isalnum() or ch in ("-", "_") else "_"
         for ch in (stats.get("project_name") or "clip-index")
     ).strip("_") or "clip-index"
     filename = f"{safe_name}-clips.json"
 
-    return Response(
-        content=body,
+    def generate():
+        # Stream the envelope as `{"<header keys...>", "clips": [<clip>, <clip>, ...]}`
+        # one clip at a time so we never hold the full payload in memory and the
+        # browser starts receiving bytes immediately (no idle-timeout abort).
+        prefix = json.dumps(header, ensure_ascii=False, default=str)[:-1]
+        if header:
+            yield f"{prefix}, \"clips\": ["
+        else:
+            yield "{\"clips\": ["
+        for index, clip in enumerate(clips):
+            chunk = json.dumps(clip, ensure_ascii=False, default=str)
+            yield chunk if index == 0 else f", {chunk}"
+        yield "]}"
+
+    return StreamingResponse(
+        generate(),
         media_type="application/json",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Accel-Buffering": "no",
         },
     )
 

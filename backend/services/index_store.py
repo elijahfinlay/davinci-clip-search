@@ -43,6 +43,7 @@ class IndexStore:
                     clip_id TEXT PRIMARY KEY,
                     content_signature TEXT,
                     vision_cache_signature TEXT,
+                    media_id TEXT,
                     project_uid TEXT NOT NULL,
                     timeline_uid TEXT NOT NULL,
                     timeline_name TEXT NOT NULL,
@@ -100,8 +101,16 @@ class IndexStore:
                 conn.execute(
                     "ALTER TABLE clips ADD COLUMN detected_objects_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "media_id" not in columns:
+                conn.execute("ALTER TABLE clips ADD COLUMN media_id TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_clips_content_signature ON clips(content_signature)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_clips_media_id ON clips(media_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_clips_file_path ON clips(file_path)"
             )
             conn.execute(
                 """
@@ -205,7 +214,8 @@ class IndexStore:
             SELECT clip_id, content_signature, source_signature, tags_json,
                    vision_cache_signature, visual_descriptions_json, description, transcript, clip_type,
                    detected_objects_json,
-                   thumbnail_data
+                   thumbnail_data,
+                   media_id, file_path, file_name, duration_frames
             FROM clips
             WHERE project_uid = ?
         """
@@ -340,17 +350,18 @@ class IndexStore:
             conn.execute(
                 """
                 INSERT INTO clips (
-                    clip_id, content_signature, vision_cache_signature, project_uid, timeline_uid, timeline_name, timeline_index,
+                    clip_id, content_signature, vision_cache_signature, media_id, project_uid, timeline_uid, timeline_name, timeline_index,
                     clip_name, file_path, file_name, track, track_name, item_index,
                     start_frame, end_frame, duration_frames, duration_seconds, fps,
                     start_timecode, end_timecode, source_in, source_out, resolution, codec,
                     clip_color, clip_type, has_audio, description, transcript, detected_objects_json,
                     tags_json, markers_json, timeline_markers_json, visual_descriptions_json,
                     searchable_text, source_signature, thumbnail_data, indexed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(clip_id) DO UPDATE SET
                     content_signature = excluded.content_signature,
                     vision_cache_signature = excluded.vision_cache_signature,
+                    media_id = excluded.media_id,
                     project_uid = excluded.project_uid,
                     timeline_uid = excluded.timeline_uid,
                     timeline_name = excluded.timeline_name,
@@ -571,17 +582,18 @@ class IndexStore:
                 conn.executemany(
                     """
                     INSERT INTO clips (
-                        clip_id, content_signature, vision_cache_signature, project_uid, timeline_uid, timeline_name, timeline_index,
+                        clip_id, content_signature, vision_cache_signature, media_id, project_uid, timeline_uid, timeline_name, timeline_index,
                         clip_name, file_path, file_name, track, track_name, item_index,
                         start_frame, end_frame, duration_frames, duration_seconds, fps,
                         start_timecode, end_timecode, source_in, source_out, resolution, codec,
                         clip_color, clip_type, has_audio, description, transcript, detected_objects_json,
                         tags_json, markers_json, timeline_markers_json, visual_descriptions_json,
                         searchable_text, source_signature, thumbnail_data, indexed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(clip_id) DO UPDATE SET
                         content_signature = excluded.content_signature,
                         vision_cache_signature = excluded.vision_cache_signature,
+                        media_id = excluded.media_id,
                         project_uid = excluded.project_uid,
                         timeline_uid = excluded.timeline_uid,
                         timeline_name = excluded.timeline_name,
@@ -668,6 +680,7 @@ class IndexStore:
             clip.clip_id,
             clip.content_signature,
             clip.vision_cache_signature,
+            clip.media_id,
             clip.project_uid,
             clip.timeline_uid,
             clip.timeline_name,

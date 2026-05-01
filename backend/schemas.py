@@ -81,6 +81,8 @@ class ReindexStateModel(BaseModel):
     quick_mode: bool = False
     latest_clip: SearchResultModel | None = None
     latest_clip_stage: str | None = None
+    reused_clips: int = 0
+    new_clips: int = 0
 
 
 class StatusResponseModel(BaseModel):

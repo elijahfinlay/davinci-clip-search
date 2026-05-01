@@ -87,6 +87,7 @@ class ClipRecord:
     searchable_text: str = ""
     source_signature: str = ""
     thumbnail_data: str | None = None
+    media_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -129,6 +130,8 @@ class ReindexState:
     quick_mode: bool = False
     latest_clip: dict[str, Any] | None = None
     latest_clip_stage: str | None = None
+    reused_clips: int = 0
+    new_clips: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -150,4 +153,6 @@ class ReindexState:
             "quick_mode": self.quick_mode,
             "latest_clip": self.latest_clip,
             "latest_clip_stage": self.latest_clip_stage,
+            "reused_clips": self.reused_clips,
+            "new_clips": self.new_clips,
         }

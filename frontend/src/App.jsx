@@ -574,6 +574,8 @@ export default function ResolveClipSearch() {
       active_clip_name: null,
       latest_clip: null,
       latest_clip_stage: null,
+      reused_clips: 0,
+      new_clips: 0,
     },
   });
   const [toast, setToast] = useState(null);
@@ -1227,12 +1229,20 @@ export default function ResolveClipSearch() {
   const reindexFillPercent = isBusy
     ? Math.max(reindexPercent, status.reindex.active_clip_index ? 1 : 0)
     : reindexPercent;
+  const reusedNewSummary =
+    (status.reindex.reused_clips || 0) + (status.reindex.new_clips || 0) > 0
+      ? `${status.reindex.reused_clips || 0} reused · ${status.reindex.new_clips || 0} new`
+      : null;
   const reindexDetail = status.reindex.running
     ? (
         status.reindex.active_clip_name
-          ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete · clip ${status.reindex.active_clip_index} in progress`
+          ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete · clip ${status.reindex.active_clip_index} in progress${
+              reusedNewSummary ? ` · ${reusedNewSummary}` : ""
+            }`
           : status.reindex.total_clips
-            ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete`
+            ? `${status.reindex.processed_clips}/${status.reindex.total_clips} complete${
+                reusedNewSummary ? ` · ${reusedNewSummary}` : ""
+              }`
             : "Preparing timeline scan"
       )
     : (

@@ -48,6 +48,7 @@ class EnrichmentTask:
 class ClipBuildResult:
     clip: ClipRecord
     enrichment_task: EnrichmentTask | None = None
+    reused: bool = False
 
 
 @dataclass(slots=True)
@@ -515,16 +516,22 @@ class IndexingService:
         }
         existing_cache_by_clip_id = self.store.get_existing_cache(
             signature["project_uid"],
-            timeline_uids=replace_timeline_uids if (target_uids or target_names) else None,
         )
         existing_cache_by_content_signature: dict[str, list[dict[str, Any]]] = {}
+        existing_cache_by_media_id: dict[str, list[dict[str, Any]]] = {}
+        existing_cache_by_file_path: dict[str, list[dict[str, Any]]] = {}
         for cached in existing_cache_by_clip_id.values():
             content_signature = str(cached.get("content_signature") or "").strip()
-            if not content_signature:
-                continue
-            existing_cache_by_content_signature.setdefault(content_signature, []).append(
-                cached
-            )
+            if content_signature:
+                existing_cache_by_content_signature.setdefault(content_signature, []).append(
+                    cached
+                )
+            cached_media_id = str(cached.get("media_id") or "").strip()
+            if cached_media_id:
+                existing_cache_by_media_id.setdefault(cached_media_id, []).append(cached)
+            cached_file_path = str(cached.get("file_path") or "").strip().lower()
+            if cached_file_path:
+                existing_cache_by_file_path.setdefault(cached_file_path, []).append(cached)
         total_target_clips = sum(
             timeline["clip_count"]
             for timeline in signature["timelines"]
@@ -666,6 +673,8 @@ class IndexingService:
                                 timeline_markers=timeline_markers,
                                 existing_cache_by_clip_id=existing_cache_by_clip_id,
                                 existing_cache_by_content_signature=existing_cache_by_content_signature,
+                                existing_cache_by_media_id=existing_cache_by_media_id,
+                                existing_cache_by_file_path=existing_cache_by_file_path,
                                 quick_mode=quick_mode,
                             )
                         except IndexingCancelledError:
@@ -691,14 +700,23 @@ class IndexingService:
                         seen_clip_ids.add(clip.clip_id)
                         if build_result.enrichment_task:
                             enrichment_tasks.append(build_result.enrichment_task)
+                        if build_result.reused:
+                            state.reused_clips += 1
+                        else:
+                            state.new_clips += 1
                         timeline_clip_count += 1
                         current_indexed += 1
                         state.processed_clips = current_indexed
                         if total_target_clips:
                             state.progress = min(current_indexed / total_target_clips, 1.0)
-                        state.message = f'Indexed {current_indexed}/{total_target_clips} clips'
+                        state.message = (
+                            f'Indexed {current_indexed}/{total_target_clips} clips '
+                            f'· {state.reused_clips} reused, {state.new_clips} new'
+                        )
                         state.latest_clip = clip_record_to_result(clip)
-                        state.latest_clip_stage = "Completed clip"
+                        state.latest_clip_stage = (
+                            "Reused cached analysis" if build_result.reused else "Completed clip"
+                        )
                         if progress_callback:
                             progress_callback(state)
                         if session_action_callback:
@@ -766,6 +784,8 @@ class IndexingService:
         timeline_markers: list[MarkerInfo],
         existing_cache_by_clip_id: dict[str, dict[str, Any]],
         existing_cache_by_content_signature: dict[str, list[dict[str, Any]]],
+        existing_cache_by_media_id: dict[str, list[dict[str, Any]]],
+        existing_cache_by_file_path: dict[str, list[dict[str, Any]]],
         quick_mode: bool,
     ) -> ClipBuildResult:
         media_pool_item = safe_call(item.GetMediaPoolItem)
@@ -983,6 +1003,7 @@ class IndexingService:
                 clip_id=clip_id,
                 content_signature=content_signature,
                 vision_cache_signature=vision_cache_signature_value,
+                media_id=str(media_id) if media_id else None,
                 project_uid=signature["project_uid"],
                 timeline_uid=timeline_uid,
                 timeline_name=timeline_name,
@@ -1022,6 +1043,15 @@ class IndexingService:
         cached = existing_cache_by_clip_id.get(clip_id)
         if cached and cached.get("content_signature") != content_signature:
             cached = None
+        if not cached and media_id:
+            media_candidates = existing_cache_by_media_id.get(str(media_id), [])
+            cached = media_candidates[0] if media_candidates else None
+        if not cached and file_path:
+            path_candidates = existing_cache_by_file_path.get(
+                file_path.strip().lower(),
+                [],
+            )
+            cached = path_candidates[0] if path_candidates else None
         if not cached:
             cached_candidates = existing_cache_by_content_signature.get(
                 content_signature,
@@ -1100,7 +1130,8 @@ class IndexingService:
                     vision_cache_signature_value=effective_vision_signature,
                     thumbnail_data_value=thumbnail_data,
                     detected_objects_value=detected_objects,
-                )
+                ),
+                reused=True,
             )
         if cached_local_analysis_reusable:
             visual_descriptions = cached_visual_descriptions
@@ -1266,6 +1297,8 @@ class ReindexCoordinator:
                 active_clip_index=0,
                 active_clip_name=None,
                 quick_mode=quick_mode,
+                reused_clips=0,
+                new_clips=0,
             )
             self._broadcast_locked()
 
@@ -1385,7 +1418,9 @@ class ReindexCoordinator:
                     self._state.enriched_clips = 0
                     self._state.total_enrichment_clips = len(build_result.enrichment_tasks)
                     self._state.message = (
-                        f"Index ready, Gemini enriching 0/{len(build_result.enrichment_tasks)} clips"
+                        f"Index ready ({self._state.reused_clips} reused, "
+                        f"{self._state.new_clips} new) · Gemini enriching "
+                        f"0/{len(build_result.enrichment_tasks)} clips"
                     )
                     self._broadcast_locked()
                     self._enrichment_worker = threading.Thread(
@@ -1398,7 +1433,10 @@ class ReindexCoordinator:
                     )
                     self._enrichment_worker.start()
                 else:
-                    self._state.message = "Index complete"
+                    self._state.message = (
+                        f"Index complete · {self._state.reused_clips} reused, "
+                        f"{self._state.new_clips} new"
+                    )
                     self._state.finished_at = now_iso()
                     self._broadcast_locked()
             self._fail_pending_jump_requests(
