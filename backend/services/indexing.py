@@ -17,7 +17,7 @@ from backend.config import Settings
 from .index_store import IndexStore
 from .resolve_api import ResolveFacade, ResolveConnectionError, safe_call
 from .search import canonical_clip_type, format_fps, human_duration
-from .timecode import timeline_frame_to_timecode
+from .timecode import timecode_to_frames, timeline_frame_to_timecode
 from .types import (
     ClipRecord,
     MarkerInfo,
@@ -501,10 +501,15 @@ class IndexingService:
         progress_callback: ProgressCallback | None = None,
         session_action_callback: SessionActionCallback | None = None,
         cancellation_callback: CancellationCallback | None = None,
+        in_timecode: str | None = None,
+        out_timecode: str | None = None,
     ) -> IndexBuildResult:
         signature = self.resolve.compute_project_signature()
         target_uids = set(timeline_uids or [])
         target_names = set(timeline_names or [])
+        range_in_tc = (in_timecode or "").strip() or None
+        range_out_tc = (out_timecode or "").strip() or None
+        range_active = bool(range_in_tc or range_out_tc)
         replace_timeline_uids = {
             timeline["timeline_uid"]
             for timeline in signature["timelines"]
@@ -610,15 +615,47 @@ class IndexingService:
                     in {"1", "true", "yes"}
                     or ";" in timeline_start_tc
                 )
-                self.store.upsert_timeline(
-                    TimelineRecord(
-                        timeline_uid=timeline_uid,
-                        project_uid=signature["project_uid"],
-                        timeline_name=timeline_name,
-                        timeline_index=timeline_index,
-                        clip_count=0,
+                if not range_active:
+                    self.store.upsert_timeline(
+                        TimelineRecord(
+                            timeline_uid=timeline_uid,
+                            project_uid=signature["project_uid"],
+                            timeline_name=timeline_name,
+                            timeline_index=timeline_index,
+                            clip_count=0,
+                        )
                     )
-                )
+
+                # Compute per-timeline range bounds (timeline-relative frames).
+                # Empty / unparseable inputs default to "open" on that side.
+                range_in_frame = -1
+                range_out_frame = -1
+                if range_active:
+                    timeline_base_frames = timecode_to_frames(
+                        timeline_start_tc,
+                        timeline_fps,
+                        drop_frame=drop_frame,
+                    )
+                    if range_in_tc:
+                        try:
+                            tc_frames = timecode_to_frames(
+                                range_in_tc, timeline_fps, drop_frame=drop_frame
+                            )
+                            range_in_frame = (
+                                timeline_start_frame + (tc_frames - timeline_base_frames)
+                            )
+                        except ValueError:
+                            range_in_frame = -1
+                    if range_out_tc:
+                        try:
+                            tc_frames = timecode_to_frames(
+                                range_out_tc, timeline_fps, drop_frame=drop_frame
+                            )
+                            range_out_frame = (
+                                timeline_start_frame + (tc_frames - timeline_base_frames)
+                            )
+                        except ValueError:
+                            range_out_frame = -1
 
                 track_count = safe_call(timeline.GetTrackCount, "video", default=0) or 0
                 timeline_clip_count = 0
@@ -644,6 +681,18 @@ class IndexingService:
                     for item_index, item in enumerate(ordered_items, start=1):
                         if cancellation_callback and cancellation_callback():
                             raise IndexingCancelledError("Indexing stopped by user.")
+
+                        if range_active:
+                            item_start = int(safe_call(item.GetStart, default=0) or 0)
+                            item_duration = int(safe_call(item.GetDuration, default=0) or 0)
+                            item_end = item_start + max(item_duration, 0)
+                            # Past the out point — items are sorted by start, so we can stop.
+                            if range_out_frame >= 0 and item_start > range_out_frame:
+                                break
+                            # Before the in point — keep scanning for in-range items.
+                            if range_in_frame >= 0 and item_end < range_in_frame:
+                                continue
+
                         clip_label = safe_call(item.GetName) or f"Clip {item_index}"
                         state.current_timeline = timeline_name
                         state.active_clip_index = current_indexed + 1
@@ -744,27 +793,29 @@ class IndexingService:
                 if cancellation_callback and cancellation_callback():
                     raise IndexingCancelledError("Indexing stopped by user.")
 
-                self.store.upsert_timeline(
-                    TimelineRecord(
-                        timeline_uid=timeline_uid,
-                        project_uid=signature["project_uid"],
-                        timeline_name=timeline_name,
-                        timeline_index=timeline_index,
-                        clip_count=timeline_clip_count,
+                if not range_active:
+                    self.store.upsert_timeline(
+                        TimelineRecord(
+                            timeline_uid=timeline_uid,
+                            project_uid=signature["project_uid"],
+                            timeline_name=timeline_name,
+                            timeline_index=timeline_index,
+                            clip_count=timeline_clip_count,
+                        )
                     )
-                )
                 seen_timeline_uids.add(timeline_uid)
 
             if cancellation_callback and cancellation_callback():
                 raise IndexingCancelledError("Indexing stopped by user.")
-            self.store.cleanup_index_scope(
-                project_uid=signature["project_uid"],
-                keep_clip_ids=seen_clip_ids,
-                keep_timeline_uids=seen_timeline_uids,
-                target_timeline_uids=(
-                    replace_timeline_uids if (target_uids or target_names) else None
-                ),
-            )
+            if not range_active:
+                self.store.cleanup_index_scope(
+                    project_uid=signature["project_uid"],
+                    keep_clip_ids=seen_clip_ids,
+                    keep_timeline_uids=seen_timeline_uids,
+                    target_timeline_uids=(
+                        replace_timeline_uids if (target_uids or target_names) else None
+                    ),
+                )
             self.store.finalize_project_meta(
                 ProjectIndexMeta(
                     project_uid=signature["project_uid"],
@@ -1507,6 +1558,8 @@ class ReindexCoordinator:
         timeline_uids: list[str] | None,
         timeline_names: list[str] | None,
         quick_mode: bool,
+        in_timecode: str | None = None,
+        out_timecode: str | None = None,
     ) -> ReindexState:
         with self._lock:
             if self._state.running or self._state.enrichment_running:
@@ -1541,6 +1594,8 @@ class ReindexCoordinator:
                     "timeline_uids": timeline_uids,
                     "timeline_names": timeline_names,
                     "quick_mode": quick_mode,
+                    "in_timecode": in_timecode,
+                    "out_timecode": out_timecode,
                 },
                 daemon=True,
             )
@@ -1623,6 +1678,8 @@ class ReindexCoordinator:
         timeline_uids: list[str] | None,
         timeline_names: list[str] | None,
         quick_mode: bool,
+        in_timecode: str | None = None,
+        out_timecode: str | None = None,
     ) -> None:
         try:
             build_result = self.indexing_service.build_index(
@@ -1632,6 +1689,8 @@ class ReindexCoordinator:
                 progress_callback=self._update,
                 session_action_callback=self._service_pending_jump_requests,
                 cancellation_callback=self._is_cancel_requested,
+                in_timecode=in_timecode,
+                out_timecode=out_timecode,
             )
             with self._lock:
                 cancelled = self._cancel_requested.is_set()

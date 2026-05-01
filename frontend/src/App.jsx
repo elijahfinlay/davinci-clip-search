@@ -540,6 +540,8 @@ export default function ResolveClipSearch() {
   const [searchTimelineQuery, setSearchTimelineQuery] = useState("");
   const [selectedTimelineUids, setSelectedTimelineUids] = useState([]);
   const [indexScopeOpen, setIndexScopeOpen] = useState(false);
+  const [inTimecode, setInTimecode] = useState("");
+  const [outTimecode, setOutTimecode] = useState("");
   const [timelineSearchQuery, setTimelineSearchQuery] = useState("");
   const [results, setResults] = useState([]);
   const [liveClips, setLiveClips] = useState([]);
@@ -1037,12 +1039,16 @@ export default function ResolveClipSearch() {
       const timelineNames = selectedTimelineOptions.length
         ? selectedTimelineOptions.map((option) => option.timeline_name)
         : null;
+      const trimmedIn = inTimecode.trim();
+      const trimmedOut = outTimecode.trim();
       const nextState = await request("/api/reindex", {
         method: "POST",
         body: JSON.stringify({
           quick_mode: status.index.quick_mode,
           timeline_uids: timelineUids,
           timeline_names: timelineNames,
+          in_timecode: trimmedIn || null,
+          out_timecode: trimmedOut || null,
         }),
       });
       setStatus((current) => ({
@@ -1050,11 +1056,15 @@ export default function ResolveClipSearch() {
         reindex: nextState,
       }));
       setIndexScopeOpen(false);
+      const rangeNote =
+        trimmedIn || trimmedOut
+          ? ` · range ${trimmedIn || "start"} → ${trimmedOut || "end"}`
+          : "";
       setToast({
         type: "success",
-        message: selectedTimelineOptions.length
+        message: (selectedTimelineOptions.length
           ? `Reindex started for ${selectedTimelineOptions.length === 1 ? selectedTimelineOptions[0].timeline_name : `${selectedTimelineOptions.length} timelines`}`
-          : "Reindex started for full project",
+          : "Reindex started for full project") + rangeNote,
       });
     } catch (error) {
       setToast({
@@ -1620,6 +1630,93 @@ export default function ResolveClipSearch() {
 
                   <div
                     style={{
+                      height: 1,
+                      background: "rgba(255,255,255,0.05)",
+                      margin: "6px 4px",
+                    }}
+                  />
+
+                  <div style={{ padding: "6px 6px 4px" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "baseline",
+                        marginBottom: 6,
+                        padding: "0 4px",
+                      }}
+                    >
+                      <span
+                        style={{
+                          color: "rgba(255,255,255,0.55)",
+                          fontSize: 10,
+                          fontFamily: "'DM Sans', system-ui, sans-serif",
+                        }}
+                      >
+                        Range (optional)
+                      </span>
+                      {(inTimecode || outTimecode) && (
+                        <button
+                          onClick={() => {
+                            setInTimecode("");
+                            setOutTimecode("");
+                          }}
+                          style={{
+                            background: "transparent",
+                            border: "none",
+                            color: "rgba(255,255,255,0.4)",
+                            fontSize: 10,
+                            fontFamily: "'DM Sans', system-ui, sans-serif",
+                            cursor: "pointer",
+                            padding: 0,
+                          }}
+                        >
+                          clear
+                        </button>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        value={inTimecode}
+                        onChange={(event) => setInTimecode(event.target.value)}
+                        placeholder="In  01:00:00:00"
+                        spellCheck={false}
+                        style={{
+                          flex: 1,
+                          height: 28,
+                          borderRadius: 6,
+                          border: "1px solid rgba(255,255,255,0.07)",
+                          background: "rgba(255,255,255,0.03)",
+                          color: "rgba(255,255,255,0.78)",
+                          fontSize: 10,
+                          fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                          padding: "0 8px",
+                          boxSizing: "border-box",
+                        }}
+                      />
+                      <input
+                        value={outTimecode}
+                        onChange={(event) => setOutTimecode(event.target.value)}
+                        placeholder="Out  01:05:00:00"
+                        spellCheck={false}
+                        style={{
+                          flex: 1,
+                          height: 28,
+                          borderRadius: 6,
+                          border: "1px solid rgba(255,255,255,0.07)",
+                          background: "rgba(255,255,255,0.03)",
+                          color: "rgba(255,255,255,0.78)",
+                          fontSize: 10,
+                          fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                          padding: "0 8px",
+                          boxSizing: "border-box",
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
                       padding: "8px 10px 6px",
                       color: "rgba(255,255,255,0.22)",
                       fontSize: 10,
@@ -1629,6 +1726,11 @@ export default function ResolveClipSearch() {
                     {selectedTimelineUids.length
                       ? `${selectedTimelineUids.length} timeline${selectedTimelineUids.length === 1 ? "" : "s"} selected`
                       : "All timelines in project"}
+                    {(inTimecode.trim() || outTimecode.trim()) && (
+                      <span style={{ display: "block", marginTop: 2 }}>
+                        range {inTimecode.trim() || "start"} → {outTimecode.trim() || "end"}
+                      </span>
+                    )}
                   </div>
                 </div>
               )}

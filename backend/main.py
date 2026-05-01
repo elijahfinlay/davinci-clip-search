@@ -294,6 +294,8 @@ def reindex(request: ReindexRequestModel) -> ReindexStateModel:
             timeline_uids=request.timeline_uids,
             timeline_names=request.timeline_names,
             quick_mode=quick_mode,
+            in_timecode=request.in_timecode,
+            out_timecode=request.out_timecode,
         )
     except ResolveConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

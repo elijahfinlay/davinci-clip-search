@@ -111,6 +111,8 @@ class ReindexRequestModel(BaseModel):
     timeline_uids: list[str] | None = None
     timeline_names: list[str] | None = None
     quick_mode: bool | None = None
+    in_timecode: str | None = None
+    out_timecode: str | None = None
 
 
 class HealthModel(BaseModel):
