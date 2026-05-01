@@ -655,10 +655,9 @@ class IndexingService:
                             progress_callback(state)
 
                         try:
-                            build_result = self._build_clip_record(
-                                project=project,
-                                signature=signature,
-                                timeline=timeline,
+                            build_result = self._try_fast_cache_path(
+                                item=item,
+                                project_uid=signature["project_uid"],
                                 timeline_uid=timeline_uid,
                                 timeline_name=timeline_name,
                                 timeline_index=timeline_index,
@@ -669,14 +668,34 @@ class IndexingService:
                                 track_index=track_index,
                                 track_name=track_name,
                                 item_index=item_index,
-                                item=item,
                                 timeline_markers=timeline_markers,
-                                existing_cache_by_clip_id=existing_cache_by_clip_id,
-                                existing_cache_by_content_signature=existing_cache_by_content_signature,
                                 existing_cache_by_media_id=existing_cache_by_media_id,
-                                existing_cache_by_file_path=existing_cache_by_file_path,
+                                existing_cache_by_clip_id=existing_cache_by_clip_id,
                                 quick_mode=quick_mode,
                             )
+                            if build_result is None:
+                                build_result = self._build_clip_record(
+                                    project=project,
+                                    signature=signature,
+                                    timeline=timeline,
+                                    timeline_uid=timeline_uid,
+                                    timeline_name=timeline_name,
+                                    timeline_index=timeline_index,
+                                    timeline_start_frame=timeline_start_frame,
+                                    timeline_start_tc=timeline_start_tc,
+                                    timeline_fps=timeline_fps,
+                                    drop_frame=drop_frame,
+                                    track_index=track_index,
+                                    track_name=track_name,
+                                    item_index=item_index,
+                                    item=item,
+                                    timeline_markers=timeline_markers,
+                                    existing_cache_by_clip_id=existing_cache_by_clip_id,
+                                    existing_cache_by_content_signature=existing_cache_by_content_signature,
+                                    existing_cache_by_media_id=existing_cache_by_media_id,
+                                    existing_cache_by_file_path=existing_cache_by_file_path,
+                                    quick_mode=quick_mode,
+                                )
                         except IndexingCancelledError:
                             raise
                         except Exception as exc:
@@ -763,6 +782,220 @@ class IndexingService:
             project_meta=project_meta,
             enrichment_tasks=enrichment_tasks,
         )
+
+    def _try_fast_cache_path(
+        self,
+        *,
+        item: Any,
+        project_uid: str,
+        timeline_uid: str,
+        timeline_name: str,
+        timeline_index: int,
+        timeline_start_frame: int,
+        timeline_start_tc: str,
+        timeline_fps: float,
+        drop_frame: bool,
+        track_index: int,
+        track_name: str,
+        item_index: int,
+        timeline_markers: list[MarkerInfo],
+        existing_cache_by_media_id: dict[str, list[dict[str, Any]]],
+        existing_cache_by_clip_id: dict[str, dict[str, Any]],
+        quick_mode: bool,
+    ) -> ClipBuildResult | None:
+        # Returns a fully-reused ClipBuildResult when this clip's source media
+        # is already analyzed in cache. None means "fall through to the slow
+        # path" — caller will run the full Resolve metadata read.
+        if quick_mode:
+            return None
+
+        media_pool_item = safe_call(item.GetMediaPoolItem)
+        if not media_pool_item:
+            return None
+        media_id_value = safe_call(media_pool_item.GetMediaId)
+        if not media_id_value:
+            return None
+        media_id_key = str(media_id_value)
+
+        candidates = existing_cache_by_media_id.get(media_id_key, [])
+        cached = candidates[0] if candidates else None
+        if not cached:
+            return None
+
+        desired_vision_signature = self.visual_analyzer.cache_signature()
+        cached_vision_signature = str(cached.get("vision_cache_signature") or "")
+        if cached_vision_signature != desired_vision_signature:
+            # Cache exists but vision provider/sig changed — let the slow path
+            # re-run analysis.
+            return None
+
+        cached_visual_descriptions = [
+            VisualDescription(
+                frame_offset_sec=float(entry["frame_offset_sec"]),
+                description=str(entry["description"]),
+            )
+            for entry in json.loads(cached.get("visual_descriptions_json") or "[]")
+        ]
+        cached_description = str(cached.get("description") or "")
+        cached_clip_type = str(cached.get("clip_type") or "handheld")
+        cached_file_path = str(cached.get("file_path") or "")
+
+        if looks_like_heuristic_visual(
+            description=cached_description,
+            visual_descriptions=cached_visual_descriptions,
+            clip_type=cached_clip_type,
+            file_path=cached_file_path,
+        ):
+            # The cached row is a heuristic fallback — re-analyze on slow path.
+            return None
+
+        item_uid = safe_call(item.GetUniqueId)
+        start_frame = int(safe_call(item.GetStart, default=0) or 0)
+        duration_frames = int(safe_call(item.GetDuration, default=0) or 0)
+        end_frame = int(
+            safe_call(item.GetEnd, default=start_frame + duration_frames)
+            or (start_frame + duration_frames)
+        )
+
+        clip_name = (
+            safe_call(item.GetName)
+            or safe_call(media_pool_item.GetName)
+            or f"Clip {item_index}"
+        )
+        clip_id = item_uid or hashlib.sha1(
+            f"{timeline_uid}:{track_index}:{item_index}:{media_id_key}:{start_frame}:{clip_name}".encode("utf-8")
+        ).hexdigest()
+
+        file_path = cached_file_path
+        file_name = str(
+            cached.get("file_name")
+            or (Path(file_path).name if file_path else clip_name)
+        )
+
+        cached_fps = parse_float(cached.get("fps"), timeline_fps or 24.0)
+        fps = cached_fps if cached_fps else (timeline_fps or 24.0)
+        duration_seconds = (max(duration_frames, 0) / fps) if fps else 0.0
+
+        tc_start = timeline_frame_to_timecode(
+            timeline_start_frame=timeline_start_frame,
+            timeline_start_timecode=timeline_start_tc,
+            frame=start_frame,
+            timeline_fps=timeline_fps,
+            drop_frame=drop_frame,
+        )
+        tc_end = timeline_frame_to_timecode(
+            timeline_start_frame=timeline_start_frame,
+            timeline_start_timecode=timeline_start_tc,
+            frame=end_frame,
+            timeline_fps=timeline_fps,
+            drop_frame=drop_frame,
+        )
+
+        cached_markers = [
+            MarkerInfo(
+                frame=int(entry.get("frame", 0)),
+                color=str(entry.get("color", "")),
+                name=str(entry.get("name", "")),
+                note=str(entry.get("note", "")),
+                duration=float(entry.get("duration", 0.0) or 0.0),
+                custom_data=str(entry.get("custom_data", "")),
+            )
+            for entry in json.loads(cached.get("markers_json") or "[]")
+        ]
+        near_markers = nearby_markers(
+            timeline_markers,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
+        cached_tags = json.loads(cached.get("tags_json") or "[]")
+        detected_objects = [
+            str(entry) for entry in json.loads(cached.get("detected_objects_json") or "[]")
+        ]
+        transcript_value = cached.get("transcript")
+        codec = cached.get("codec")
+        resolution = cached.get("resolution")
+
+        content_signature = build_content_signature(
+            file_name=file_name,
+            duration_frames=duration_frames,
+        )
+
+        searchable_text = build_searchable_text(
+            clip_name=clip_name,
+            file_name=file_name,
+            file_path=file_path,
+            timeline_name=timeline_name,
+            track_name=track_name,
+            description=cached_description,
+            transcript=str(transcript_value) if transcript_value else None,
+            tags=cached_tags,
+            clip_type=cached_clip_type,
+            markers=cached_markers,
+            timeline_markers=near_markers,
+            visual_descriptions=cached_visual_descriptions,
+            codec=codec,
+            resolution=resolution,
+        )
+
+        source_signature = build_source_signature(
+            clip_name=clip_name,
+            file_path=file_path,
+            timeline_name=timeline_name,
+            track_index=track_index,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            duration_frames=duration_frames,
+            fps=fps,
+            resolution=str(resolution) if resolution is not None else None,
+            codec=str(codec) if codec is not None else None,
+            markers=cached_markers,
+            timeline_markers=near_markers,
+            transcript=str(transcript_value) if transcript_value else None,
+            vision_cache_signature=cached_vision_signature,
+        )
+
+        clip = ClipRecord(
+            clip_id=clip_id,
+            content_signature=content_signature,
+            vision_cache_signature=cached_vision_signature,
+            media_id=media_id_key,
+            project_uid=project_uid,
+            timeline_uid=timeline_uid,
+            timeline_name=timeline_name,
+            timeline_index=timeline_index,
+            clip_name=clip_name,
+            file_path=file_path,
+            file_name=file_name,
+            track=track_index,
+            track_name=track_name,
+            item_index=item_index,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            duration_frames=max(duration_frames, 0),
+            duration_seconds=duration_seconds,
+            fps=fps,
+            start_timecode=tc_start,
+            end_timecode=tc_end,
+            source_in=str(cached.get("source_in")) if cached.get("source_in") else None,
+            source_out=str(cached.get("source_out")) if cached.get("source_out") else None,
+            resolution=str(resolution) if resolution is not None else None,
+            codec=str(codec) if codec is not None else None,
+            clip_color=str(cached.get("clip_color")) if cached.get("clip_color") else None,
+            clip_type=cached_clip_type,
+            has_audio=bool(cached.get("has_audio")),
+            description=cached_description,
+            transcript=str(transcript_value) if transcript_value else None,
+            detected_objects=detected_objects,
+            tags=cached_tags,
+            markers=cached_markers,
+            timeline_markers=near_markers,
+            visual_descriptions=cached_visual_descriptions,
+            searchable_text=searchable_text,
+            source_signature=source_signature,
+            thumbnail_data=cached.get("thumbnail_data"),
+        )
+
+        return ClipBuildResult(clip=clip, enrichment_task=None, reused=True)
 
     def _build_clip_record(
         self,

@@ -215,7 +215,10 @@ class IndexStore:
                    vision_cache_signature, visual_descriptions_json, description, transcript, clip_type,
                    detected_objects_json,
                    thumbnail_data,
-                   media_id, file_path, file_name, duration_frames
+                   media_id, file_path, file_name, duration_frames,
+                   codec, resolution, fps, clip_color, has_audio,
+                   source_in, source_out,
+                   markers_json
             FROM clips
             WHERE project_uid = ?
         """
