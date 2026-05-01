@@ -18,18 +18,40 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+# If a tracked server is already alive AND its API responds, reuse it.
+# Otherwise fall through to a fresh start so a stale pidfile or a zombie left
+# over by a SIGTERM-during-reindex hang doesn't block the relaunch.
 if [[ -f "$PID_FILE" ]]; then
   EXISTING_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [[ -n "$EXISTING_PID" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
-    open "$APP_URL"
-    exit 0
+    if curl -fsS --max-time 2 "$APP_URL/api/health" >/dev/null 2>&1; then
+      open "$APP_URL"
+      exit 0
+    fi
   fi
   rm -f "$PID_FILE"
 fi
 
+# Port held but no responsive tracked server — likely a wedged zombie. Try to
+# free the port (graceful, then forced) before launching.
 if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
-  open "$APP_URL"
-  exit 0
+  PORT_PID="$(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$PORT_PID" ]]; then
+    kill "$PORT_PID" 2>/dev/null || true
+  fi
+  for _ in 1 2 3 4 5 6 7 8; do
+    if ! lsof -tiTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  if lsof -tiTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
+    PORT_PID="$(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$PORT_PID" ]]; then
+      kill -9 "$PORT_PID" 2>/dev/null || true
+    fi
+    sleep 1
+  fi
 fi
 
 nohup "$PYTHON_BIN" run.py >>"$LOG_FILE" 2>&1 &
