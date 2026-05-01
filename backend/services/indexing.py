@@ -504,6 +504,8 @@ class IndexingService:
         in_timecode: str | None = None,
         out_timecode: str | None = None,
     ) -> IndexBuildResult:
+        # Discard any cached project walk so the indexer sees current state.
+        self.resolve.invalidate_project_signature()
         signature = self.resolve.compute_project_signature()
         target_uids = set(timeline_uids or [])
         target_names = set(timeline_names or [])

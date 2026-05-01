@@ -7,6 +7,7 @@ import os
 import platform
 import sys
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -118,6 +119,10 @@ class ResolveFacade:
             connected=False,
             message="Resolve status unavailable.",
         )
+        self._signature_lock = threading.Lock()
+        self._signature_ttl_sec = 5.0
+        self._cached_signature: dict[str, Any] | None = None
+        self._cached_signature_at: float = 0.0
 
     def _connect(self) -> tuple[Any, Any, Any]:
         module = _bootstrap_resolve_module()
@@ -171,7 +176,24 @@ class ResolveFacade:
                 self._cached_status = status
             return status
 
+    def invalidate_project_signature(self) -> None:
+        with self._signature_lock:
+            self._cached_signature = None
+            self._cached_signature_at = 0.0
+
     def compute_project_signature(self) -> dict[str, Any]:
+        # Hot endpoints (/api/status) hit this on every poll. For a project
+        # with thousands of clips and dozens of timelines this enumerates
+        # everything via the single-threaded Resolve scripting bridge — easy
+        # to wedge the worker pool. Cache the result briefly so repeated polls
+        # coalesce instead of stacking up behind one another.
+        with self._signature_lock:
+            cached = self._cached_signature
+            if cached is not None:
+                age = time.monotonic() - self._cached_signature_at
+                if age < self._signature_ttl_sec:
+                    return cached
+
         def _build(_resolve: Any, _project_manager: Any, project: Any) -> dict[str, Any]:
             timelines: list[dict[str, Any]] = []
             total_clips = 0
@@ -232,7 +254,11 @@ class ResolveFacade:
             ).hexdigest()
             return payload
 
-        return self.with_project(_build)
+        result = self.with_project(_build)
+        with self._signature_lock:
+            self._cached_signature = result
+            self._cached_signature_at = time.monotonic()
+        return result
 
     def jump_to_clip(
         self,
