@@ -271,6 +271,8 @@ class ResolveFacade:
         file_path: str | None = None,
         duration_frames: int | None = None,
         track_index: int | None = None,
+        start_frame: int | None = None,
+        media_id: str | None = None,
     ) -> dict[str, Any]:
         def _jump(resolve: Any, _project_manager: Any, project: Any) -> dict[str, Any]:
             return self.jump_to_clip_in_project(
@@ -284,6 +286,8 @@ class ResolveFacade:
                 file_path=file_path,
                 duration_frames=duration_frames,
                 track_index=track_index,
+                start_frame=start_frame,
+                media_id=media_id,
             )
 
         return self.with_project(_jump)
@@ -301,7 +305,38 @@ class ResolveFacade:
         file_path: str | None = None,
         duration_frames: int | None = None,
         track_index: int | None = None,
+        start_frame: int | None = None,
+        media_id: str | None = None,
     ) -> dict[str, Any]:
+        # Fast path: when we know the indexed timeline + track + start_frame
+        # (always true for clips that came out of our own indexer), look just
+        # at that one track and match by clip_id (UID), exact start_frame, or
+        # start_frame+media_id. Avoids the project-wide walk that costs ~6
+        # Resolve RPCs per timeline-item across ~12k items — the source of
+        # the ~1s jump latency.
+        fast_target = self._fast_locate_clip(
+            project=project,
+            clip_id=clip_id,
+            timeline_uid=timeline_uid,
+            timeline_name=timeline_name,
+            track_index=track_index,
+            start_frame=start_frame,
+            media_id=media_id,
+        )
+        if fast_target is not None:
+            self._apply_jump(
+                resolve=resolve,
+                project=project,
+                target_timeline=fast_target["timeline"],
+                target_timeline_uid=fast_target["timeline_uid"],
+                target_timeline_name=fast_target["timeline_name"],
+                target_timecode=fast_target["start_timecode"],
+            )
+            return {
+                "timeline_name": fast_target["timeline_name"],
+                "start_timecode": fast_target["start_timecode"],
+            }
+
         timeline_count = safe_call(project.GetTimelineCount, default=0) or 0
         preferred_timelines: list[tuple[Any, str | None, str]] = []
         other_timelines: list[tuple[Any, str | None, str]] = []
@@ -350,6 +385,9 @@ class ResolveFacade:
         )
 
         target_timeline = resolved_target["timeline"] if resolved_target else fallback_timeline
+        target_timeline_uid = (
+            resolved_target["timeline_uid"] if resolved_target else timeline_uid
+        )
         target_timeline_name = (
             resolved_target["timeline_name"] if resolved_target else timeline_name
         )
@@ -357,12 +395,152 @@ class ResolveFacade:
             resolved_target["start_timecode"] if resolved_target else start_timecode
         )
 
-        if not safe_call(project.SetCurrentTimeline, target_timeline, default=False):
-            raise ResolveConnectionError(
-                f'Failed to switch Resolve to timeline "{target_timeline_name}".'
-            )
+        self._apply_jump(
+            resolve=resolve,
+            project=project,
+            target_timeline=target_timeline,
+            target_timeline_uid=target_timeline_uid,
+            target_timeline_name=target_timeline_name,
+            target_timecode=target_timecode,
+        )
 
-        safe_call(resolve.OpenPage, "edit", default=False)
+        return {
+            "timeline_name": target_timeline_name,
+            "start_timecode": target_timecode,
+        }
+
+    def _fast_locate_clip(
+        self,
+        *,
+        project: Any,
+        clip_id: str,
+        timeline_uid: str | None,
+        timeline_name: str,
+        track_index: int | None,
+        start_frame: int | None,
+        media_id: str | None,
+    ) -> dict[str, Any] | None:
+        # Need a track to scope the lookup; without it we'd be doing a full
+        # timeline walk which is what the slow path already handles.
+        if track_index is None or track_index <= 0:
+            return None
+
+        # Locate the indexed timeline. Prefer UID match, then name match. We
+        # bail out the moment we find it instead of categorizing every
+        # timeline up front.
+        timeline_count = safe_call(project.GetTimelineCount, default=0) or 0
+        target_timeline: Any = None
+        target_uid: str | None = None
+        target_name: str = timeline_name
+        if timeline_uid:
+            for ti in range(1, timeline_count + 1):
+                timeline = safe_call(project.GetTimelineByIndex, ti)
+                if not timeline:
+                    continue
+                candidate_uid = safe_call(timeline.GetUniqueId)
+                if candidate_uid == timeline_uid:
+                    target_timeline = timeline
+                    target_uid = candidate_uid
+                    target_name = safe_call(timeline.GetName) or timeline_name
+                    break
+        if target_timeline is None:
+            for ti in range(1, timeline_count + 1):
+                timeline = safe_call(project.GetTimelineByIndex, ti)
+                if not timeline:
+                    continue
+                candidate_name = safe_call(timeline.GetName) or f"Timeline {ti}"
+                if candidate_name == timeline_name:
+                    target_timeline = timeline
+                    target_uid = safe_call(timeline.GetUniqueId)
+                    target_name = candidate_name
+                    break
+        if target_timeline is None:
+            return None
+
+        items = safe_call(
+            target_timeline.GetItemListInTrack,
+            "video",
+            track_index,
+            default=[],
+        ) or []
+
+        # 1. Try UID match — strongest signal when the timeline-item UID has
+        # survived the session. Cheap, single RPC per item on this one track.
+        if clip_id:
+            for item in items:
+                item_uid = safe_call(item.GetUniqueId)
+                if item_uid and item_uid == clip_id:
+                    target_tc = self._timeline_item_start_timecode(
+                        project=project,
+                        timeline=target_timeline,
+                        item=item,
+                    )
+                    return {
+                        "timeline": target_timeline,
+                        "timeline_uid": target_uid,
+                        "timeline_name": target_name,
+                        "start_timecode": target_tc,
+                    }
+
+        # 2. Try start_frame (+ optional media_id) — durable identity that
+        # survives Resolve regenerating timeline-item UIDs across sessions.
+        if start_frame is not None:
+            for item in items:
+                item_start = safe_call(item.GetStart)
+                if item_start is None:
+                    continue
+                if int(item_start) != int(start_frame):
+                    continue
+                if media_id:
+                    media_pool_item = safe_call(item.GetMediaPoolItem)
+                    item_media_id = (
+                        safe_call(media_pool_item.GetMediaId)
+                        if media_pool_item
+                        else None
+                    )
+                    if item_media_id != media_id:
+                        continue
+                target_tc = self._timeline_item_start_timecode(
+                    project=project,
+                    timeline=target_timeline,
+                    item=item,
+                )
+                return {
+                    "timeline": target_timeline,
+                    "timeline_uid": target_uid,
+                    "timeline_name": target_name,
+                    "start_timecode": target_tc,
+                }
+
+        return None
+
+    def _apply_jump(
+        self,
+        *,
+        resolve: Any,
+        project: Any,
+        target_timeline: Any,
+        target_timeline_uid: str | None,
+        target_timeline_name: str,
+        target_timecode: str,
+    ) -> None:
+        # Skip the timeline switch if we're already on the right one.
+        # Resolve's SetCurrentTimeline is user-visible and slow.
+        current_timeline = safe_call(project.GetCurrentTimeline)
+        current_uid = (
+            safe_call(current_timeline.GetUniqueId) if current_timeline else None
+        )
+        already_on_target = bool(target_timeline_uid) and current_uid == target_timeline_uid
+        if not already_on_target:
+            if not safe_call(project.SetCurrentTimeline, target_timeline, default=False):
+                raise ResolveConnectionError(
+                    f'Failed to switch Resolve to timeline "{target_timeline_name}".'
+                )
+
+        # Skip OpenPage when already on Edit.
+        if safe_call(resolve.GetCurrentPage) != "edit":
+            safe_call(resolve.OpenPage, "edit", default=False)
+
         if not safe_call(
             target_timeline.SetCurrentTimecode,
             target_timecode,
@@ -371,11 +549,6 @@ class ResolveFacade:
             raise ResolveConnectionError(
                 f'Failed to move the playhead to {target_timecode} in "{target_timeline_name}".'
             )
-
-        return {
-            "timeline_name": target_timeline_name,
-            "start_timecode": target_timecode,
-        }
 
     def _find_live_clip_location(
         self,

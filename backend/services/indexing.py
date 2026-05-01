@@ -1878,6 +1878,8 @@ class ReindexCoordinator:
                     file_path=request.clip.get("file_path"),
                     duration_frames=request.clip.get("duration_frames"),
                     track_index=request.clip.get("track"),
+                    start_frame=request.clip.get("start_frame"),
+                    media_id=request.clip.get("media_id"),
                 )
             except Exception as exc:
                 request.error = (

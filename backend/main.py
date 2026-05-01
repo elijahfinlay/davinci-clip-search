@@ -353,6 +353,8 @@ def jump(request: JumpRequestModel) -> JumpResponseModel:
                 file_path=clip["file_path"],
                 duration_frames=clip["duration_frames"],
                 track_index=clip["track"],
+                start_frame=clip.get("start_frame"),
+                media_id=clip.get("media_id"),
             )
     except ResolveConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
